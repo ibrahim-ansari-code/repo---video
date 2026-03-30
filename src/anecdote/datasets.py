@@ -214,7 +214,18 @@ def _download_tip_i2v(cfg: dict, output_dir: Path, num_samples: int) -> None:
 
     console.print(f"  [dim]Loading {cfg['hf_dataset']} (Eval split, streaming)...[/]")
 
-    ds = load_dataset(cfg["hf_dataset"], split="Eval", streaming=True)
+    # TIP-I2V has 30 parquet files (27 Full + 2 Subset + 1 Eval). Resolving
+    # all of them is extremely slow. Point directly at the single Eval file
+    # (77MB, 10K rows) which is more than enough for 200 samples.
+    try:
+        ds = load_dataset(
+            cfg["hf_dataset"],
+            split="train",
+            streaming=True,
+            data_files="data/Eval-00000-of-00001.parquet",
+        )
+    except Exception:
+        ds = load_dataset(cfg["hf_dataset"], split="Eval", streaming=True)
 
     collected = 0
     captions: dict[str, str] = {}
