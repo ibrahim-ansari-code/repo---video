@@ -1,13 +1,24 @@
 """Built-in dataset support for LoRA training.
 
-Downloads curated video/image datasets from Hugging Face so users don't need
-to provide their own reference material. Three style presets:
+Three tiers of training data, from best (video) to easiest (image-only):
 
-  cinematic  — Pexels stock footage: professional camera work, smooth motion
-  developer  — Developer/tech-themed clips: screens, typing, office settings
-  dramatic   — High-contrast dramatic scenes: good for anecdote intros
+  Tier 1 — Video datasets (actual mp4 clips + captions):
+    "pusa"        — PusaV1 training set: 3,860 Wan-generated video-caption pairs
+                    (gold standard for I2V LoRA fine-tuning on Wan2.1)
+    "cinematic"   — CinematicT2vData/cinepile_captions: ~3.5k cinematic clips
+                    from films with detailed scene descriptions
 
-Each downloads a small subset (50-200 samples) suitable for LoRA fine-tuning.
+  Tier 2 — Video-from-URL datasets (downloads video URLs from metadata):
+    "pexels"      — jovianzm/Pexels-400k: stock video thumbnails/URLs filtered
+                    by visual style keywords (cinematic, dramatic, etc.)
+
+  Tier 3 — Image-only datasets (still images + synthetic captions):
+    "developer"   — Pexels filtered for tech/dev scenes (keyboard, screen, code)
+    "dramatic"    — Pexels filtered for moody/dramatic scenes
+
+Video datasets produce proper (first_frame, video_clip, caption) triples for
+real video-diffusion training. Image-only datasets degrade gracefully into
+image-reconstruction training (less effective but still usable for style).
 """
 
 from __future__ import annotations
@@ -17,6 +28,7 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 from PIL import Image
 from rich.console import Console
@@ -26,35 +38,90 @@ from src.config import CACHE_DIR
 
 console = Console()
 
-BUILTIN_DATASETS = {
-    "cinematic": {
+
+DatasetTier = Literal["i2v", "video", "image"]
+
+
+BUILTIN_DATASETS: dict[str, dict] = {
+    "tip-i2v": {
+        "hf_dataset": "WenhaoWang/TIP-I2V",
+        "tier": "i2v",
+        "description": (
+            "TIP-I2V (ICCV 2025) — 1.7M real user image+text prompt pairs for I2V. "
+            "Each sample has an Image_Prompt (first frame) + Text_Prompt (caption). "
+            "The gold standard for image-to-video LoRA training."
+        ),
+        "num_samples": 200,
+        "max_samples": 10000,
+        "download_fn": "_download_tip_i2v",
+    },
+    "pusa": {
+        "hf_dataset": "RaphaelLiu/PusaV1_training",
+        "tier": "video",
+        "description": (
+            "PusaV1 training set — 3,860 Wan-T2V generated video-caption pairs. "
+            "Good for learning motion/style but text-to-video only (no image condition)."
+        ),
+        "num_samples": 200,
+        "max_samples": 3860,
+        "download_fn": "_download_pusa_videos",
+    },
+    "pexels": {
         "hf_dataset": "jovianzm/Pexels-400k",
-        "description": "Professional stock footage — smooth camera motion, cinematic lighting",
+        "tier": "video",
+        "description": (
+            "Pexels stock footage — professional camera motion, smooth "
+            "transitions, cinematic lighting. Downloads actual video URLs."
+        ),
+        "num_samples": 100,
+        "max_samples": 5000,
         "filter_keywords": [
             "cinematic", "aerial", "slow motion", "timelapse", "landscape",
             "sunset", "city", "nature", "ocean", "clouds",
         ],
+        "download_fn": "_download_pexels_videos",
+    },
+    "cinematic": {
+        "hf_dataset": "CinematicT2vData/cinepile_captions",
+        "tier": "video",
+        "description": (
+            "Cinematic film clips with detailed scene descriptions — camera work, "
+            "lighting, composition. 3,490 video-caption pairs."
+        ),
         "num_samples": 100,
+        "max_samples": 3490,
+        "download_fn": "_download_cinematic_videos",
     },
     "developer": {
         "hf_dataset": "jovianzm/Pexels-400k",
-        "description": "Developer/tech scenes — screens, typing, offices, code",
+        "tier": "image",
+        "description": (
+            "Developer/tech scenes — screens, typing, offices, code. "
+            "Image-only (still frames); best for style transfer, not motion."
+        ),
+        "num_samples": 100,
+        "max_samples": 1000,
         "filter_keywords": [
             "computer", "laptop", "coding", "typing", "office", "desk",
             "programmer", "developer", "screen", "keyboard", "technology",
             "working", "startup", "meeting",
         ],
-        "num_samples": 100,
+        "download_fn": "_download_pexels_images",
     },
     "dramatic": {
         "hf_dataset": "jovianzm/Pexels-400k",
-        "description": "High-contrast dramatic scenes — great for problem-setup anecdotes",
+        "tier": "image",
+        "description": (
+            "High-contrast dramatic scenes — storms, silhouettes, moody lighting. "
+            "Image-only; good for anecdote intro style."
+        ),
+        "num_samples": 100,
+        "max_samples": 1000,
         "filter_keywords": [
             "dramatic", "dark", "moody", "storm", "rain", "night",
             "silhouette", "shadow", "intense", "frustrated", "stressed",
-            "worried", "alone", "struggle",
         ],
-        "num_samples": 100,
+        "download_fn": "_download_pexels_images",
     },
 }
 
@@ -62,7 +129,13 @@ BUILTIN_DATASETS = {
 def list_builtin_datasets() -> list[dict]:
     """Return info about available built-in datasets."""
     return [
-        {"name": name, "description": cfg["description"], "samples": cfg["num_samples"]}
+        {
+            "name": name,
+            "description": cfg["description"],
+            "tier": cfg["tier"],
+            "samples": cfg["num_samples"],
+            "hf_dataset": cfg["hf_dataset"],
+        }
         for name, cfg in BUILTIN_DATASETS.items()
     ]
 
@@ -74,14 +147,16 @@ def download_dataset(
 ) -> Path:
     """Download a built-in dataset and prepare it for LoRA training.
 
-    Returns the path to a directory containing images and a captions.json file.
+    Returns the path to a directory containing:
+      - For video datasets: *.mp4 files + captions.json + first-frame PNGs
+      - For image datasets: *.jpg files + captions.json
     """
     if dataset_name not in BUILTIN_DATASETS:
         available = ", ".join(BUILTIN_DATASETS.keys())
         raise ValueError(f"Unknown dataset '{dataset_name}'. Available: {available}")
 
     cfg = BUILTIN_DATASETS[dataset_name]
-    num_samples = max_samples or cfg["num_samples"]
+    num_samples = min(max_samples or cfg["num_samples"], cfg["max_samples"])
 
     if output_dir is None:
         output_dir = CACHE_DIR / "datasets" / dataset_name
@@ -89,36 +164,60 @@ def download_dataset(
 
     marker = output_dir / ".downloaded"
     if marker.exists():
-        existing = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
-        if len(existing) >= num_samples // 2:
-            console.print(f"  [dim]Using cached dataset: {output_dir} ({len(existing)} images)[/]")
+        existing_videos = list(output_dir.glob("*.mp4"))
+        existing_images = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
+        if len(existing_videos) >= num_samples // 2 or len(existing_images) >= num_samples // 2:
+            total = len(existing_videos) + len(existing_images)
+            console.print(f"  [dim]Using cached dataset: {output_dir} ({total} files)[/]")
             return output_dir
 
-    console.print(f"[bold blue]Downloading[/] '{dataset_name}' dataset ({num_samples} samples)")
+    console.print(f"[bold blue]Downloading[/] '{dataset_name}' ({cfg['tier']} tier, {num_samples} samples)")
 
-    _download_pexels_thumbnails(cfg, output_dir, num_samples)
+    download_fn = globals()[cfg["download_fn"]]
+    download_fn(cfg, output_dir, num_samples)
 
-    marker.write_text(json.dumps({"dataset": dataset_name, "samples": num_samples}))
-    final_count = len(list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png")))
-    console.print(f"[bold green]Downloaded[/] {final_count} training images to {output_dir}")
+    marker.write_text(json.dumps({
+        "dataset": dataset_name,
+        "tier": cfg["tier"],
+        "samples": num_samples,
+    }))
+
+    videos = list(output_dir.glob("*.mp4"))
+    images = [f for f in output_dir.glob("*.jpg") if not f.stem.startswith("frame_")]
+    images += [f for f in output_dir.glob("*.png") if not f.stem.startswith("frame_")]
+    console.print(
+        f"[bold green]Downloaded[/] {len(videos)} videos, {len(images)} images to {output_dir}"
+    )
     return output_dir
 
 
-def _download_pexels_thumbnails(cfg: dict, output_dir: Path, num_samples: int) -> None:
-    """Download thumbnail images from the Pexels-400k dataset, filtered by keywords."""
+# ---------------------------------------------------------------------------
+# Tier 0 (I2V): TIP-I2V — real image+text prompt pairs for I2V training
+# ---------------------------------------------------------------------------
+
+def _download_tip_i2v(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Download image-to-video training pairs from TIP-I2V.
+
+    Each sample has an Image_Prompt (the source image / first frame) and a
+    Text_Prompt (the motion/scene description). This is exactly what the
+    Wan2.1 I2V model needs: an image to condition on + a text prompt.
+
+    We save:
+      - sample_XXXX.png  (the image prompt / first frame)
+      - captions.json     (text prompts keyed by filename)
+      - tier marker as "i2v" so the trainer knows to use I2V conditioning
+    """
     try:
         from datasets import load_dataset
     except ImportError:
         raise RuntimeError("Install the 'datasets' library: pip install datasets")
 
-    hf_dataset = cfg["hf_dataset"]
-    keywords = cfg["filter_keywords"]
+    console.print(f"  [dim]Loading {cfg['hf_dataset']} (Eval split, streaming)...[/]")
 
-    console.print(f"  [dim]Loading {hf_dataset} metadata...[/]")
-    ds = load_dataset(hf_dataset, split="train", streaming=True)
+    ds = load_dataset(cfg["hf_dataset"], split="Eval", streaming=True)
 
     collected = 0
-    captions = {}
+    captions: dict[str, str] = {}
 
     with Progress(
         SpinnerColumn(),
@@ -127,7 +226,226 @@ def _download_pexels_thumbnails(cfg: dict, output_dir: Path, num_samples: int) -
         TextColumn("{task.completed}/{task.total}"),
         console=console,
     ) as progress:
-        task = progress.add_task(f"Filtering '{cfg['filter_keywords'][0]}' videos", total=num_samples)
+        task = progress.add_task("Downloading TIP-I2V pairs", total=num_samples)
+
+        for row in ds:
+            if collected >= num_samples:
+                break
+
+            image_prompt = row.get("Image_Prompt")
+            text_prompt = row.get("Text_Prompt") or ""
+            nsfw_text = row.get("Text_NSFW", 0.0) or 0.0
+            nsfw_image = row.get("Image_NSFW", "SAFE") or "SAFE"
+
+            if image_prompt is None:
+                continue
+            if nsfw_text > 0.3 or nsfw_image != "SAFE":
+                continue
+            if len(text_prompt) < 10:
+                continue
+
+            try:
+                if isinstance(image_prompt, Image.Image):
+                    img = image_prompt
+                elif isinstance(image_prompt, dict) and "bytes" in image_prompt:
+                    img = Image.open(io.BytesIO(image_prompt["bytes"]))
+                else:
+                    continue
+
+                img = img.convert("RGB").resize((720, 480))
+                filename = f"sample_{collected:04d}.png"
+                img.save(output_dir / filename, "PNG")
+
+                captions[filename] = text_prompt.strip()
+                collected += 1
+                progress.update(task, completed=collected)
+            except Exception:
+                continue
+
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: PusaV1 — real Wan-generated videos with pre-encoded latents
+# ---------------------------------------------------------------------------
+
+def _download_pusa_videos(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Download video files and captions from the PusaV1 training dataset.
+
+    PusaV1 provides: train/*.mp4 (source videos) + metadata.csv (captions).
+    We download the mp4 files and extract first frames locally.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+
+    console.print(f"  [dim]Loading {cfg['hf_dataset']} metadata...[/]")
+
+    ds = load_dataset(cfg["hf_dataset"], split="train", streaming=True)
+
+    collected = 0
+    captions: dict[str, str] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Downloading PusaV1 videos", total=num_samples)
+
+        for row in ds:
+            if collected >= num_samples:
+                break
+
+            video_data = row.get("video")
+            caption = row.get("text") or row.get("prompt") or row.get("caption") or ""
+
+            if video_data is None:
+                continue
+
+            filename = f"pusa_{collected:04d}.mp4"
+            video_path = output_dir / filename
+
+            try:
+                if isinstance(video_data, dict) and "bytes" in video_data:
+                    video_path.write_bytes(video_data["bytes"])
+                elif isinstance(video_data, dict) and "path" in video_data:
+                    import shutil
+                    shutil.copy2(video_data["path"], video_path)
+                elif isinstance(video_data, bytes):
+                    video_path.write_bytes(video_data)
+                elif isinstance(video_data, str):
+                    _download_file(video_data, video_path)
+                else:
+                    continue
+
+                if not video_path.exists() or video_path.stat().st_size < 1000:
+                    video_path.unlink(missing_ok=True)
+                    continue
+
+                _extract_first_frame_ffmpeg(video_path, output_dir)
+
+                if not caption:
+                    caption = f"A smooth cinematic video clip, high quality, Wan-generated"
+                captions[filename] = caption
+
+                collected += 1
+                progress.update(task, completed=collected)
+            except Exception:
+                video_path.unlink(missing_ok=True)
+                continue
+
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: CinematicT2vData — film clips with rich scene descriptions
+# ---------------------------------------------------------------------------
+
+def _download_cinematic_videos(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Download cinematic video clips from CinematicT2vData.
+
+    The dataset has video_id + caption. We download the actual video if available,
+    otherwise fall back to extracting YouTube clips via the video_id.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+
+    console.print(f"  [dim]Loading {cfg['hf_dataset']}...[/]")
+
+    ds = load_dataset(cfg["hf_dataset"], split="train", streaming=True)
+
+    collected = 0
+    captions: dict[str, str] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Downloading cinematic clips", total=num_samples)
+
+        for row in ds:
+            if collected >= num_samples:
+                break
+
+            video_data = row.get("video")
+            caption = row.get("caption") or row.get("text") or ""
+
+            if video_data is None and not caption:
+                continue
+
+            filename = f"cinematic_{collected:04d}.mp4"
+            video_path = output_dir / filename
+
+            try:
+                if video_data is not None:
+                    if isinstance(video_data, dict) and "bytes" in video_data:
+                        video_path.write_bytes(video_data["bytes"])
+                    elif isinstance(video_data, dict) and "path" in video_data:
+                        import shutil
+                        shutil.copy2(video_data["path"], video_path)
+                    elif isinstance(video_data, bytes):
+                        video_path.write_bytes(video_data)
+                    elif isinstance(video_data, str):
+                        _download_file(video_data, video_path)
+                    else:
+                        continue
+                else:
+                    continue
+
+                if not video_path.exists() or video_path.stat().st_size < 1000:
+                    video_path.unlink(missing_ok=True)
+                    continue
+
+                _extract_first_frame_ffmpeg(video_path, output_dir)
+
+                if not caption:
+                    caption = "A cinematic film scene with professional cinematography"
+                captions[filename] = caption
+
+                collected += 1
+                progress.update(task, completed=collected)
+            except Exception:
+                video_path.unlink(missing_ok=True)
+                continue
+
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Pexels stock footage — download actual videos via URL
+# ---------------------------------------------------------------------------
+
+def _download_pexels_videos(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Download actual video files from Pexels-400k, filtered by keywords."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+
+    keywords = cfg.get("filter_keywords", [])
+    console.print(f"  [dim]Loading {cfg['hf_dataset']} metadata (streaming)...[/]")
+    ds = load_dataset(cfg["hf_dataset"], split="train", streaming=True)
+
+    collected = 0
+    captions: dict[str, str] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Downloading Pexels videos", total=num_samples)
 
         for row in ds:
             if collected >= num_samples:
@@ -137,7 +455,83 @@ def _download_pexels_thumbnails(cfg: dict, output_dir: Path, num_samples: int) -
             tags = (row.get("tags") or row.get("Tags") or "").lower()
             searchable = f"{title} {tags}"
 
-            if not any(kw in searchable for kw in keywords):
+            if keywords and not any(kw in searchable for kw in keywords):
+                continue
+
+            video_url = (
+                row.get("contentUrl")
+                or row.get("video_url")
+                or row.get("VideoUrl")
+                or row.get("content_url")
+            )
+            if not video_url or not isinstance(video_url, str):
+                continue
+
+            filename = f"pexels_{collected:04d}.mp4"
+            video_path = output_dir / filename
+
+            try:
+                _download_file(video_url, video_path, timeout=30)
+
+                if not video_path.exists() or video_path.stat().st_size < 5000:
+                    video_path.unlink(missing_ok=True)
+                    continue
+
+                _trim_video(video_path, max_seconds=4.0)
+                _extract_first_frame_ffmpeg(video_path, output_dir)
+
+                caption = title.strip() or "A stock footage clip"
+                captions[filename] = f"{caption}, smooth motion, high quality, cinematic"
+
+                collected += 1
+                progress.update(task, completed=collected)
+            except Exception:
+                video_path.unlink(missing_ok=True)
+                continue
+
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Image-only fallback — Pexels thumbnails (no motion learning)
+# ---------------------------------------------------------------------------
+
+def _download_pexels_images(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Download thumbnail images from Pexels-400k, filtered by keywords.
+
+    Image-only mode: useful for style transfer LoRA training but won't teach
+    the model anything about motion or temporal coherence.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+
+    keywords = cfg.get("filter_keywords", [])
+    console.print(f"  [dim]Loading {cfg['hf_dataset']} metadata (streaming)...[/]")
+    ds = load_dataset(cfg["hf_dataset"], split="train", streaming=True)
+
+    collected = 0
+    captions: dict[str, str] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task(f"Downloading '{cfg.get('filter_keywords', [''])[0]}' images", total=num_samples)
+
+        for row in ds:
+            if collected >= num_samples:
+                break
+
+            title = (row.get("title") or row.get("Title") or "").lower()
+            tags = (row.get("tags") or row.get("Tags") or "").lower()
+            searchable = f"{title} {tags}"
+
+            if keywords and not any(kw in searchable for kw in keywords):
                 continue
 
             thumbnail = row.get("thumbnail") or row.get("Thumbnail")
@@ -146,7 +540,7 @@ def _download_pexels_thumbnails(cfg: dict, output_dir: Path, num_samples: int) -
 
             try:
                 if isinstance(thumbnail, str):
-                    img = _download_image(thumbnail)
+                    img = _download_image_from_url(thumbnail)
                 elif isinstance(thumbnail, Image.Image):
                     img = thumbnail
                 elif isinstance(thumbnail, dict) and "bytes" in thumbnail:
@@ -158,35 +552,75 @@ def _download_pexels_thumbnails(cfg: dict, output_dir: Path, num_samples: int) -
                 filename = f"sample_{collected:04d}.jpg"
                 img.save(output_dir / filename, "JPEG", quality=90)
 
-                caption = title.strip() or f"a video clip, smooth motion, cinematic"
+                caption = title.strip() or "a scene, smooth motion, cinematic"
                 captions[filename] = f"{caption}, smooth motion, high quality, cinematic"
                 collected += 1
                 progress.update(task, completed=collected)
-
             except Exception:
                 continue
 
-    captions_path = output_dir / "captions.json"
-    captions_path.write_text(json.dumps(captions, indent=2))
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
 
 
-def _download_image(url: str) -> Image.Image:
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _download_file(url: str, dest: Path, timeout: int = 15) -> None:
+    """Download a file from URL to disk."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "repovideo/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        dest.write_bytes(resp.read())
+
+
+def _download_image_from_url(url: str) -> Image.Image:
     """Download a single image from URL."""
     import urllib.request
     with urllib.request.urlopen(url, timeout=10) as resp:
         return Image.open(io.BytesIO(resp.read()))
 
 
-def prepare_builtin_dataset_for_training(dataset_name: str) -> tuple[Path, list[str]]:
-    """Download dataset and return (directory, captions) ready for LoRA training."""
-    output_dir = download_dataset(dataset_name)
+def _extract_first_frame_ffmpeg(video_path: Path, output_dir: Path) -> Path | None:
+    """Extract the first frame of a video as a PNG for I2V training pairs."""
+    frame_path = output_dir / f"frame_{video_path.stem}.png"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vf", "scale=720:480",
+        "-vframes", "1",
+        str(frame_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and frame_path.exists():
+        return frame_path
+    return None
 
-    captions_file = output_dir / "captions.json"
-    if captions_file.exists():
-        captions = json.loads(captions_file.read_text())
+
+def _trim_video(video_path: Path, max_seconds: float = 4.0) -> None:
+    """Trim a video to max_seconds from the start (in-place)."""
+    trimmed = video_path.with_suffix(".trimmed.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-t", str(max_seconds),
+        "-c:v", "libx264", "-preset", "ultrafast", "-an",
+        str(trimmed),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and trimmed.exists() and trimmed.stat().st_size > 100:
+        trimmed.replace(video_path)
     else:
-        captions = {}
-        for img in sorted(output_dir.glob("*.jpg")) + sorted(output_dir.glob("*.png")):
-            captions[img.name] = f"A video clip showing {img.stem.replace('_', ' ')}, smooth motion, high quality"
+        trimmed.unlink(missing_ok=True)
 
-    return output_dir, list(captions.values())
+
+def get_dataset_tier(dataset_name: str) -> DatasetTier:
+    """Return whether a built-in dataset provides video or image-only data."""
+    if dataset_name not in BUILTIN_DATASETS:
+        return "image"
+    return BUILTIN_DATASETS[dataset_name]["tier"]
+
+
+def prepare_builtin_dataset_for_training(dataset_name: str) -> tuple[Path, DatasetTier]:
+    """Download dataset and return (directory, tier) ready for LoRA training."""
+    output_dir = download_dataset(dataset_name)
+    tier = get_dataset_tier(dataset_name)
+    return output_dir, tier

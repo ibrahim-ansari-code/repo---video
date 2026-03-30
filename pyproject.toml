@@ -29,10 +29,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+train = [
+    "torchvision>=0.17",
+    "decord>=0.6",
+]
+serve = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
+    "torchvision>=0.17",
 ]
 
 [project.scripts]

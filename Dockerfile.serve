@@ -1,0 +1,62 @@
+# GPU inference container for Wan2.1 I2V + LoRA
+# Deploy on NodeOps CreateOS, RunPod, or any GPU-enabled Docker host.
+#
+# Build:
+#   docker build -f Dockerfile.serve -t repovideo-inference .
+#
+# Run locally:
+#   docker run --gpus all -p 8000:8000 \
+#     -e REPOVIDEO_MODEL_SIZE=1.3B \
+#     -v ./my_lora:/loras/my_style \
+#     -e REPOVIDEO_LORA_PATH=/loras/my_style \
+#     repovideo-inference
+#
+# GPU requirements:
+#   1.3B model: 8 GB VRAM  (T4, A10G, L4)
+#   14B model:  40 GB VRAM  (A100 80GB)
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-venv python3-pip \
+    ffmpeg git wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src/ src/
+
+RUN pip install --upgrade pip && \
+    pip install ".[train,serve]"
+
+# Pre-download the 1.3B model at build time (faster cold starts).
+# For 14B, set REPOVIDEO_MODEL_SIZE=14B at runtime — it downloads on first request.
+ENV REPOVIDEO_CACHE_DIR=/models
+RUN python -c "\
+from diffusers import WanImageToVideoPipeline; \
+WanImageToVideoPipeline.from_pretrained( \
+    'Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers', \
+    cache_dir='/models', \
+)"
+
+# LoRA weights volume mount point
+VOLUME /loras
+
+ENV REPOVIDEO_MODEL_SIZE=1.3B \
+    REPOVIDEO_LORA_PATH="" \
+    PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD uvicorn src.serve:app --host 0.0.0.0 --port $PORT

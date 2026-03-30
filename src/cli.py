@@ -37,8 +37,9 @@ def main(ctx):
 @click.option("--colab", is_flag=True, help="Offload GPU work to Google Colab via Google Drive")
 @click.option("--gdrive-path", type=click.Path(), default=None, help="Path to Google Drive sync folder")
 @click.option("--anecdote-file", type=click.Path(exists=True), default=None, help="Use a pre-made anecdote video (e.g. from Colab)")
-@click.option("--dataset", type=click.Choice(["cinematic", "developer", "dramatic"]), default=None,
-              help="Built-in HF dataset to train LoRA on (instead of --train-lora)")
+@click.option("--dataset", type=click.Choice(["tip-i2v", "pusa", "cinematic", "pexels", "developer", "dramatic"]),
+              default=None, help="Built-in HF dataset to train LoRA on (instead of --train-lora)")
+@click.option("--remote", default=None, help="URL of a remote GPU inference server (NodeOps, RunPod, etc.)")
 def generate(
     repo_url: str,
     output: str,
@@ -53,6 +54,7 @@ def generate(
     gdrive_path: str | None,
     anecdote_file: str | None,
     dataset: str | None,
+    remote: str | None,
 ):
     """Generate a demo video from a GitHub repo URL."""
     ensure_dirs()
@@ -71,6 +73,7 @@ def generate(
         gdrive_path=Path(gdrive_path) if gdrive_path else None,
         anecdote_file=Path(anecdote_file) if anecdote_file else None,
         dataset_name=dataset,
+        remote_url=remote,
     )
 
     console.print(Panel(
@@ -96,10 +99,16 @@ def list_datasets():
     datasets = list_builtin_datasets()
     console.print("[bold]Built-in datasets for LoRA training:[/]\n")
     for ds in datasets:
-        console.print(f"  [bold cyan]{ds['name']}[/] — {ds['description']}")
-        console.print(f"    {ds['samples']} training samples from Hugging Face")
+        tier_map = {"i2v": ("bold green", "I2V"), "video": ("green", "VIDEO"), "image": ("yellow", "IMAGE-ONLY")}
+        tier_color, tier_label = tier_map.get(ds["tier"], ("yellow", ds["tier"]))
+        console.print(
+            f"  [bold cyan]{ds['name']}[/] [{tier_color}][{tier_label}][/{tier_color}]"
+        )
+        console.print(f"    {ds['description']}")
+        console.print(f"    {ds['samples']} default samples from [dim]{ds['hf_dataset']}[/]")
         console.print()
-    console.print("[dim]Usage: repovideo generate <url> --dataset cinematic[/]")
+    console.print("[bold]Recommended:[/] Use [bold green]tip-i2v[/] (I2V tier) for best image-to-video LoRA results.")
+    console.print("[dim]Usage: repovideo generate <url> --dataset tip-i2v[/]")
 
 
 @main.command()
@@ -140,7 +149,9 @@ def _run_pipeline(config: PipelineConfig) -> None:
         console.print(f"  Using pre-made anecdote: [cyan]{anecdote_path}[/]")
     elif not config.no_anecdote:
         console.rule("[bold]Stage 2: Generating AI Anecdote")
-        if config.use_colab:
+        if config.remote_url:
+            anecdote_path, overlay_text = _generate_anecdote_via_remote(config, manifest, work_dir)
+        elif config.use_colab:
             anecdote_path, overlay_text = _generate_anecdote_via_colab(config, manifest, work_dir)
         else:
             anecdote_path, overlay_text = _generate_anecdote(config, manifest, work_dir)
@@ -352,6 +363,82 @@ def _generate_anecdote_via_colab(config: PipelineConfig, manifest, work_dir: Pat
         return None, overlay_text
 
 
+def _generate_anecdote_via_remote(
+    config: PipelineConfig, manifest, work_dir: Path,
+) -> tuple[Path | None, str]:
+    """Generate the AI anecdote using a remote GPU inference server."""
+    from src.anecdote.prompts import (
+        ANECDOTE_SYSTEM_PROMPT,
+        FALLBACK_KEYFRAMES,
+        FALLBACK_MOTION_PROMPTS,
+        FALLBACK_OVERLAY,
+        build_anecdote_prompt,
+        parse_anecdote_response,
+    )
+    from src.remote import RemoteInferenceClient
+
+    keyframes = list(FALLBACK_KEYFRAMES)
+    motion_prompts = list(FALLBACK_MOTION_PROMPTS)
+    overlay_text = FALLBACK_OVERLAY
+
+    try:
+        import litellm
+
+        user_prompt = build_anecdote_prompt(
+            manifest.name,
+            manifest.description,
+            manifest.project_type.value,
+            manifest.readme_content,
+        )
+        response = litellm.completion(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": ANECDOTE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.9,
+            max_tokens=1000,
+        )
+        parsed = parse_anecdote_response(response.choices[0].message.content)
+        keyframes = parsed["keyframes"]
+        motion_prompts = parsed["motion_prompts"]
+        overlay_text = parsed.get("overlay_text", FALLBACK_OVERLAY)
+        console.print(f"  [green]Generated anecdote scenario[/]")
+    except Exception as e:
+        console.print(f"  [yellow]LLM unavailable ({e}), using fallback prompts[/]")
+
+    try:
+        client = RemoteInferenceClient(config.remote_url)
+
+        console.print("  [dim]Generating keyframes on remote GPU...[/]")
+        image_paths = client.generate_keyframes(
+            keyframes, work_dir / "keyframes",
+        )
+        console.print(f"  [green]Got {len(image_paths)} keyframes[/]")
+
+        clip_paths: list[Path] = []
+        for i, (img_path, motion) in enumerate(zip(image_paths, motion_prompts)):
+            console.print(f"  [dim]Clip {i+1}/{len(image_paths)}:[/] {motion[:50]}...")
+            clip_path = work_dir / f"clip_{i:03d}.mp4"
+            client.generate_video(img_path, motion, clip_path)
+            clip_paths.append(clip_path)
+
+        # Concatenate clips
+        anecdote_path = work_dir / "anecdote.mp4"
+        if len(clip_paths) == 1:
+            import shutil
+            shutil.copy2(clip_paths[0], anecdote_path)
+        else:
+            from src.anecdote.video_gen import _concatenate_clips
+            _concatenate_clips(clip_paths, anecdote_path)
+
+        return anecdote_path, overlay_text
+
+    except Exception as e:
+        console.print(f"  [yellow]Remote generation failed ({e}), skipping anecdote[/]")
+        return None, overlay_text
+
+
 def _train_lora_via_colab(config: PipelineConfig) -> Path | None:
     """Run LoRA training on Colab via Google Drive."""
     from src.remote import submit_lora_training_job, download_lora_result
@@ -373,6 +460,76 @@ def _train_lora_via_colab(config: PipelineConfig) -> Path | None:
     except Exception as e:
         console.print(f"  [yellow]Colab LoRA training failed ({e}), continuing without[/]")
         return None
+
+
+@main.command()
+@click.option("--host", default="0.0.0.0", help="Bind host")
+@click.option("--port", default=8000, help="Bind port")
+@click.option("--model-size", type=click.Choice(["14B", "1.3B"]), default="1.3B", help="Wan2.1 model size")
+@click.option("--lora-path", default=None, help="Path to LoRA weights to load")
+def serve(host: str, port: int, model_size: str, lora_path: str | None):
+    """Start the inference server (for NodeOps / remote GPU hosting)."""
+    import os
+    os.environ["REPOVIDEO_MODEL_SIZE"] = model_size
+    if lora_path:
+        os.environ["REPOVIDEO_LORA_PATH"] = lora_path
+
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]Install uvicorn:[/] pip install uvicorn python-multipart")
+        sys.exit(1)
+
+    console.print(Panel(
+        f"[bold]repovideo serve[/] — Wan2.1 {model_size} inference server\n"
+        f"Endpoint: [cyan]http://{host}:{port}[/]"
+        + (f"\nLoRA: [cyan]{lora_path}[/]" if lora_path else ""),
+        border_style="blue",
+    ))
+
+    uvicorn.run("src.serve:app", host=host, port=port, reload=False)
+
+
+@main.command()
+def deploy_info():
+    """Show instructions for deploying to NodeOps CreateOS."""
+    console.print(Panel(
+        "[bold]Deploy repovideo inference to NodeOps CreateOS[/]",
+        border_style="blue",
+    ))
+    console.print("""
+[bold]1. Build the Docker image:[/]
+   docker build -f Dockerfile.serve -t repovideo-inference .
+
+[bold]2. Push to a registry:[/]
+   docker tag repovideo-inference your-registry/repovideo-inference:latest
+   docker push your-registry/repovideo-inference:latest
+
+[bold]3. Deploy on NodeOps CreateOS:[/]
+   - Go to [cyan]https://createos.nodeops.network/deploy/docker[/]
+   - Select Docker Image deployment
+   - Enter your image URL
+   - Select a GPU instance (A10G for 1.3B model, A100 for 14B)
+   - Set environment variables:
+     [dim]REPOVIDEO_MODEL_SIZE=1.3B[/]
+     [dim]REPOVIDEO_LORA_PATH=/loras/your_style[/]  (optional)
+   - Expose port [bold]8000[/]
+   - Click Deploy
+
+[bold]4. Upload your LoRA weights:[/]
+   After deploy, upload your trained LoRA:
+   [dim]curl -X POST https://your-app.nodeops.network/lora/upload \\
+     -F "file=@my_lora.zip" -F "name=my_style"[/]
+
+[bold]5. Use from your Mac:[/]
+   repovideo generate https://github.com/user/repo \\
+     --remote https://your-app.nodeops.network
+
+[bold]Pricing (NodeOps GPU):[/]
+   A10G (24 GB, good for 1.3B): ~$0.60/hr
+   A100 (80 GB, needed for 14B): ~$2.50/hr
+   Pay-per-second billing, auto-scaling available.
+""")
 
 
 if __name__ == "__main__":

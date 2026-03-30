@@ -1,16 +1,25 @@
-"""Stage 2c: LoRA fine-tuning pipeline for Wan2.1 image-to-video model.
+"""Stage 2c: LoRA fine-tuning for Wan2.1 image-to-video model.
 
-Fine-tunes the Wan2.1 I2V model with LoRA adapters using user-provided
-reference videos/images to match a specific visual style.
+Proper video diffusion training loop:
+  1. Load video clips + extract first frames
+  2. Encode videos through the Wan VAE into latent space
+  3. Encode text captions through the T5 text encoder
+  4. Encode first-frame images through the CLIP image encoder
+  5. Add noise via FlowMatch scheduler
+  6. Forward through transformer, compute denoising loss
+  7. Backprop through LoRA adapters only
+
+Supports two modes:
+  - Video mode (Tier 1/2 datasets): full video diffusion training with temporal learning
+  - Image mode (Tier 3 datasets): image reconstruction training (style only, no motion)
 """
 
 from __future__ import annotations
 
 import gc
 import json
-import shutil
+import math
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,11 +32,14 @@ from src.config import LORA_DIR, MODELS_DIR
 
 console = Console()
 
+WAN_14B_I2V = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+WAN_1_3B_I2V = "Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers"
+
 
 @dataclass
 class LoRATrainingConfig:
     reference_dir: Path | None = None
-    dataset_name: str | None = None  # built-in dataset: "cinematic", "developer", "dramatic"
+    dataset_name: str | None = None
     lora_name: str = "custom_style"
     rank: int = 32
     alpha: int = 32
@@ -36,25 +48,29 @@ class LoRATrainingConfig:
     batch_size: int = 1
     resolution_width: int = 720
     resolution_height: int = 480
+    num_frames: int = 17
     gradient_accumulation_steps: int = 4
-    max_train_epochs: int = 50
     save_every_n_steps: int = 100
     seed: int = 42
     model_size: str = "14B"
+    warmup_steps: int = 50
+    max_grad_norm: float = 1.0
+    mixed_precision: bool = True
 
 
 @dataclass
 class TrainingDataset:
-    """Prepared training data: pairs of (first_frame, video_clip)."""
+    """Prepared training data: triples of (first_frame, video_latents, caption)."""
     frame_paths: list[Path] = field(default_factory=list)
     video_paths: list[Path] = field(default_factory=list)
     captions: list[str] = field(default_factory=list)
+    tier: str = "video"
 
 
 def train_lora(config: LoRATrainingConfig) -> Path:
-    """Full LoRA training pipeline: prepare data → configure → train → save."""
+    """Full LoRA training pipeline: prepare data -> configure -> train -> save."""
     if config.dataset_name and not config.reference_dir:
-        from src.anecdote.datasets import download_dataset
+        from src.anecdote.datasets import download_dataset, get_dataset_tier
         console.print(f"[bold blue]Downloading[/] built-in dataset: {config.dataset_name}")
         config.reference_dir = download_dataset(config.dataset_name)
 
@@ -67,44 +83,67 @@ def train_lora(config: LoRATrainingConfig) -> Path:
     if len(dataset.frame_paths) == 0:
         raise ValueError(f"No valid training data found in {config.reference_dir}")
 
-    console.print(f"  [dim]Prepared {len(dataset.video_paths)} training samples[/]")
+    console.print(
+        f"  [dim]Prepared {len(dataset.frame_paths)} samples "
+        f"({len(dataset.video_paths)} with video, tier={dataset.tier})[/]"
+    )
 
     output_dir = LORA_DIR / config.lora_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _run_training(config, dataset, output_dir)
-
-    lora_weights_path = output_dir / "pytorch_lora_weights.safetensors"
-    if not lora_weights_path.exists():
-        lora_weights_path = _find_latest_checkpoint(output_dir)
+    if dataset.tier == "i2v":
+        _run_i2v_training(config, dataset, output_dir)
+    elif dataset.tier == "video" and len(dataset.video_paths) > 0:
+        _run_video_training(config, dataset, output_dir)
+    else:
+        _run_image_training(config, dataset, output_dir)
 
     _save_training_metadata(config, dataset, output_dir)
-
     console.print(f"[bold green]LoRA training complete![/] Weights saved to {output_dir}")
     return output_dir
 
 
 def _prepare_dataset(config: LoRATrainingConfig) -> TrainingDataset:
-    """Extract training pairs from reference videos and images."""
-    dataset = TrainingDataset()
+    """Build training pairs from the reference directory."""
     ref_dir = config.reference_dir
+    dataset = TrainingDataset()
 
-    saved_captions = {}
+    # Determine tier from dataset marker or from the datasets module
+    tier = "image"
+    marker_file = ref_dir / ".downloaded"
+    if marker_file.exists():
+        try:
+            meta = json.loads(marker_file.read_text())
+            tier = meta.get("tier", "image")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    elif config.dataset_name:
+        from src.anecdote.datasets import get_dataset_tier
+        tier = get_dataset_tier(config.dataset_name)
+
+    dataset.tier = tier
+
+    saved_captions: dict[str, str] = {}
     captions_file = ref_dir / "captions.json"
     if captions_file.exists():
         saved_captions = json.loads(captions_file.read_text())
 
     for video_file in sorted(ref_dir.glob("*.mp4")) + sorted(ref_dir.glob("*.webm")):
-        first_frame = _extract_first_frame(video_file, config)
-        if first_frame:
+        frame_path = ref_dir / f"frame_{video_file.stem}.png"
+        if not frame_path.exists():
+            frame_path = _extract_first_frame(video_file, config)
+        if frame_path and frame_path.exists():
             dataset.video_paths.append(video_file)
-            dataset.frame_paths.append(first_frame)
+            dataset.frame_paths.append(frame_path)
             dataset.captions.append(
                 saved_captions.get(video_file.name, _generate_caption(video_file))
             )
 
     for img_file in sorted(ref_dir.glob("*.png")) + sorted(ref_dir.glob("*.jpg")) + sorted(ref_dir.glob("*.jpeg")):
-        if not img_file.stem.startswith("frame_"):
+        if img_file.stem.startswith("frame_"):
+            continue
+        already_paired = img_file in dataset.frame_paths
+        if not already_paired:
             dataset.frame_paths.append(img_file)
             dataset.captions.append(
                 saved_captions.get(img_file.name, _generate_caption(img_file))
@@ -114,7 +153,7 @@ def _prepare_dataset(config: LoRATrainingConfig) -> TrainingDataset:
 
 
 def _extract_first_frame(video_path: Path, config: LoRATrainingConfig) -> Path | None:
-    """Extract the first frame from a video as a training input image."""
+    """Extract the first frame from a video."""
     output_path = video_path.parent / f"frame_{video_path.stem}.png"
     cmd = [
         "ffmpeg", "-y",
@@ -130,34 +169,328 @@ def _extract_first_frame(video_path: Path, config: LoRATrainingConfig) -> Path |
 
 
 def _generate_caption(file_path: Path) -> str:
-    """Generate a simple caption from the filename."""
     name = file_path.stem.replace("_", " ").replace("-", " ")
     return f"A video clip showing {name}, smooth motion, high quality"
 
 
-def _run_training(
+# ---------------------------------------------------------------------------
+# Video training: real diffusion denoising loss on VAE-encoded video latents
+# ---------------------------------------------------------------------------
+
+def _run_video_training(
     config: LoRATrainingConfig,
     dataset: TrainingDataset,
     output_dir: Path,
 ) -> None:
-    """Execute the LoRA fine-tuning loop using PEFT + diffusers."""
-    from diffusers import WanImageToVideoPipeline
-    from peft import LoraConfig, get_peft_model
+    """Train LoRA with actual video data through the full Wan2.1 pipeline.
 
-    model_id = (
-        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
-        if config.model_size == "14B"
-        else "Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers"
+    The core loop:
+      for each step:
+        1. Load video frames -> encode through VAE -> video_latents
+        2. Encode caption through T5 -> text_embeds
+        3. Encode first frame through CLIP -> image_embeds
+        4. Sample noise + timestep, add noise to latents
+        5. Forward transformer(noisy_latents, text_embeds, timestep, image_embeds)
+        6. Compute flow-matching loss: MSE(predicted_velocity, target_velocity)
+        7. Backprop through LoRA parameters only
+    """
+    from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+    from diffusers.models import WanTransformer3DModel
+    from transformers import AutoTokenizer, CLIPVisionModel, CLIPImageProcessor
+    from peft import LoraConfig, get_peft_model
+    import torchvision.transforms as T
+
+    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    device = _get_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    weight_dtype = dtype
+
+    console.print(f"  [dim]Loading model components from {model_id}[/]")
+
+    # Load components individually for memory efficiency
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32,
+        cache_dir=str(MODELS_DIR),
+    )
+    vae.to(device)
+    vae.eval()
+    vae.requires_grad_(False)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
     )
 
-    device = _get_device()
-    dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
-
-    console.print(f"  [dim]Loading base model {model_id} on {device}[/]")
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
+    from transformers import UMT5EncoderModel
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        model_id, subfolder="text_encoder", torch_dtype=weight_dtype,
         cache_dir=str(MODELS_DIR),
+    )
+    text_encoder.to(device)
+    text_encoder.eval()
+    text_encoder.requires_grad_(False)
+
+    image_encoder = CLIPVisionModel.from_pretrained(
+        model_id, subfolder="image_encoder", torch_dtype=torch.float32,
+        cache_dir=str(MODELS_DIR),
+    )
+    image_encoder.to(device)
+    image_encoder.eval()
+    image_encoder.requires_grad_(False)
+
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
+    )
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id, subfolder="transformer", torch_dtype=weight_dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    transformer.to(device)
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
+    )
+
+    # Apply LoRA to the transformer
+    lora_config = LoraConfig(
+        r=config.rank,
+        lora_alpha=config.alpha,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        lora_dropout=0.05,
+    )
+    transformer = get_peft_model(transformer, lora_config)
+    transformer.train()
+
+    trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in transformer.parameters())
+    console.print(f"  [dim]LoRA params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)[/]")
+
+    optimizer = torch.optim.AdamW(
+        [p for p in transformer.parameters() if p.requires_grad],
+        lr=config.learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+    )
+
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.num_train_steps, eta_min=config.learning_rate * 0.1,
+    )
+
+    # Pre-encode all videos into latent space (cache to save VRAM)
+    console.print("  [dim]Pre-encoding video latents through VAE...[/]")
+    video_latents_cache: list[torch.Tensor] = []
+    text_embeds_cache: list[torch.Tensor] = []
+    image_embeds_cache: list[torch.Tensor] = []
+
+    video_transform = T.Compose([
+        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
+        T.Normalize([0.5], [0.5]),
+    ])
+
+    for i, (video_path, frame_path, caption) in enumerate(
+        zip(dataset.video_paths, dataset.frame_paths, dataset.captions)
+    ):
+        # Encode video
+        video_tensor = _load_video_as_tensor(
+            video_path, config.num_frames,
+            config.resolution_height, config.resolution_width,
+        )
+        if video_tensor is None:
+            continue
+
+        video_tensor = video_tensor.to(device, dtype=torch.float32)
+        # VAE expects [B, C, F, H, W]
+        video_input = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)
+
+        with torch.no_grad():
+            latent_dist = vae.encode(video_input)
+            video_latent = latent_dist.latent_dist.sample()
+            video_latent = video_latent * vae.config.scaling_factor
+        video_latents_cache.append(video_latent.squeeze(0).cpu())
+
+        # Encode text
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_embeds_cache.append(text_embed.squeeze(0).cpu())
+
+        # Encode image (first frame) through CLIP
+        frame_img = Image.open(frame_path).convert("RGB")
+        clip_inputs = image_processor(images=frame_img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            image_embed = image_encoder(**clip_inputs).last_hidden_state
+        image_embeds_cache.append(image_embed.squeeze(0).cpu())
+
+        if (i + 1) % 10 == 0:
+            console.print(f"    [dim]Encoded {i+1}/{len(dataset.video_paths)} videos[/]")
+
+    if not video_latents_cache:
+        raise ValueError("No videos could be encoded. Check your dataset has valid .mp4 files.")
+
+    console.print(f"  [dim]Cached {len(video_latents_cache)} video latents[/]")
+
+    # Free encoders from VRAM
+    del vae, text_encoder, image_encoder
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    num_train_timesteps = scheduler.config.get("num_train_timesteps", 1000)
+
+    # Training loop
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[loss]:.4f}[/]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Training LoRA (video)", total=config.num_train_steps, loss=0.0)
+        accum_loss = 0.0
+
+        for step in range(config.num_train_steps):
+            idx = step % len(video_latents_cache)
+
+            latents = video_latents_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
+            text_emb = text_embeds_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
+            image_emb = image_embeds_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
+
+            # latents shape: [B, C, F, H, W] from VAE; transformer expects [B, F, C, H, W]
+            latents = latents.permute(0, 2, 1, 3, 4)
+            batch_size, num_frames, num_channels, height, width = latents.shape
+
+            noise = torch.randn_like(latents)
+
+            timesteps = torch.randint(
+                0, num_train_timesteps, (batch_size,), device=device,
+            ).long()
+
+            # Flow matching: noisy = (1 - sigma) * x + sigma * noise
+            # where sigma = timestep / num_train_timesteps
+            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = sigmas.view(-1, 1, 1, 1, 1)
+            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+
+            # I2V conditioning: pass first-frame CLIP embeddings so the model
+            # learns to generate video conditioned on the source image
+            model_output = transformer(
+                hidden_states=noisy_latents,
+                encoder_hidden_states=text_emb,
+                encoder_hidden_states_image=image_emb,
+                timestep=timesteps,
+                return_dict=False,
+            )[0]
+
+            target = latents - noise
+            loss = torch.nn.functional.mse_loss(model_output, target)
+
+            loss_val = loss.item()
+            accum_loss += loss_val
+
+            loss = loss / config.gradient_accumulation_steps
+            loss.backward()
+
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    transformer.parameters(), config.max_grad_norm,
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
+
+            if (step + 1) % config.save_every_n_steps == 0:
+                avg_loss = accum_loss / config.save_every_n_steps
+                accum_loss = 0.0
+                checkpoint_dir = output_dir / f"checkpoint-{step + 1}"
+                checkpoint_dir.mkdir(exist_ok=True)
+                transformer.save_pretrained(checkpoint_dir)
+                console.print(
+                    f"  [dim]Checkpoint step={step+1}, avg_loss={avg_loss:.4f}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e}[/]"
+                )
+
+            progress.update(task, advance=1, loss=loss_val)
+
+    transformer.save_pretrained(output_dir)
+
+    del transformer, optimizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# I2V training: proper image-to-video conditioning (TIP-I2V dataset)
+# ---------------------------------------------------------------------------
+
+def _run_i2v_training(
+    config: LoRATrainingConfig,
+    dataset: TrainingDataset,
+    output_dir: Path,
+) -> None:
+    """Train LoRA with image-to-video conditioning using image+text pairs.
+
+    Uses image prompts as both the CLIP conditioning input and the VAE
+    denoising target. The transformer learns to generate content conditioned
+    on the source image via encoder_hidden_states_image.
+    """
+    from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+    from diffusers.models import WanTransformer3DModel
+    from transformers import AutoTokenizer, CLIPVisionModel, CLIPImageProcessor
+    from peft import LoraConfig, get_peft_model
+    import torchvision.transforms as T
+
+    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    device = _get_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    console.print(f"  [dim]Loading I2V model components from {model_id}[/]")
+
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32,
+        cache_dir=str(MODELS_DIR),
+    )
+    vae.to(device)
+    vae.eval()
+    vae.requires_grad_(False)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
+    )
+
+    from transformers import UMT5EncoderModel
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        model_id, subfolder="text_encoder", torch_dtype=dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    text_encoder.to(device)
+    text_encoder.eval()
+    text_encoder.requires_grad_(False)
+
+    image_encoder = CLIPVisionModel.from_pretrained(
+        model_id, subfolder="image_encoder", torch_dtype=torch.float32,
+        cache_dir=str(MODELS_DIR),
+    )
+    image_encoder.to(device)
+    image_encoder.eval()
+    image_encoder.requires_grad_(False)
+
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
+    )
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id, subfolder="transformer", torch_dtype=dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    transformer.to(device)
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
     )
 
     lora_config = LoraConfig(
@@ -166,104 +499,428 @@ def _run_training(
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
         lora_dropout=0.05,
     )
-
-    transformer = pipe.transformer
     transformer = get_peft_model(transformer, lora_config)
     transformer.train()
 
-    trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in transformer.parameters())
-    console.print(
-        f"  [dim]Trainable: {trainable_params:,} / {total_params:,} "
-        f"({100 * trainable_params / total_params:.2f}%)[/]"
-    )
+    trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in transformer.parameters())
+    console.print(f"  [dim]LoRA params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)[/]")
 
     optimizer = torch.optim.AdamW(
-        transformer.parameters(),
+        [p for p in transformer.parameters() if p.requires_grad],
         lr=config.learning_rate,
+        betas=(0.9, 0.95),
         weight_decay=0.01,
     )
+
+    image_transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
+        T.Normalize([0.5], [0.5]),
+    ])
+
+    # Pre-encode all images
+    console.print("  [dim]Pre-encoding I2V training pairs...[/]")
+    latents_cache: list[torch.Tensor] = []
+    text_cache: list[torch.Tensor] = []
+    image_embed_cache: list[torch.Tensor] = []
+
+    for frame_path, caption in zip(dataset.frame_paths, dataset.captions):
+        img = Image.open(frame_path).convert("RGB")
+
+        # CLIP embedding (the I2V conditioning signal)
+        clip_inputs = image_processor(images=img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            image_embed = image_encoder(**clip_inputs).last_hidden_state
+        image_embed_cache.append(image_embed.squeeze(0).cpu())
+
+        # VAE latent (the denoising target)
+        img_tensor = image_transform(img).to(device)
+        img_input = img_tensor.unsqueeze(0).unsqueeze(2)  # [B, C, 1, H, W]
+        with torch.no_grad():
+            latent_dist = vae.encode(img_input)
+            latent = latent_dist.latent_dist.sample() * vae.config.scaling_factor
+        latents_cache.append(latent.squeeze(0).cpu())
+
+        # Text embedding
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_cache.append(text_embed.squeeze(0).cpu())
+
+    del vae, text_encoder, image_encoder
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    console.print(f"  [dim]Cached {len(latents_cache)} I2V training pairs[/]")
+
+    num_train_timesteps = scheduler.config.get("num_train_timesteps", 1000)
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[loss]:.4f}[/]"),
         console=console,
     ) as progress:
-        task = progress.add_task("Training LoRA", total=config.num_train_steps)
+        task = progress.add_task("Training LoRA (I2V)", total=config.num_train_steps, loss=0.0)
 
         for step in range(config.num_train_steps):
-            sample_idx = step % len(dataset.frame_paths)
+            idx = step % len(latents_cache)
 
-            image = Image.open(dataset.frame_paths[sample_idx]).convert("RGB")
-            image = image.resize((config.resolution_width, config.resolution_height))
+            latents = latents_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            text_emb = text_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            image_emb = image_embed_cache[idx].unsqueeze(0).to(device, dtype=dtype)
 
-            caption = dataset.captions[sample_idx]
+            # [B, C, 1, H, W] -> [B, 1, C, H, W]
+            latents = latents.permute(0, 2, 1, 3, 4)
+            batch_size = latents.shape[0]
 
-            loss = _training_step(pipe, transformer, image, caption, device, dtype)
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, num_train_timesteps, (batch_size,), device=device).long()
 
-            optimizer.zero_grad()
+            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = sigmas.view(-1, 1, 1, 1, 1)
+            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+
+            model_output = transformer(
+                hidden_states=noisy_latents,
+                encoder_hidden_states=text_emb,
+                encoder_hidden_states_image=image_emb,
+                timestep=timesteps,
+                return_dict=False,
+            )[0]
+
+            target = latents - noise
+            loss = torch.nn.functional.mse_loss(model_output, target)
+            loss_val = loss.item()
+
+            loss = loss / config.gradient_accumulation_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
-            optimizer.step()
+
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), config.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
 
             if (step + 1) % config.save_every_n_steps == 0:
                 checkpoint_dir = output_dir / f"checkpoint-{step + 1}"
                 checkpoint_dir.mkdir(exist_ok=True)
                 transformer.save_pretrained(checkpoint_dir)
-                console.print(f"  [dim]Checkpoint saved at step {step + 1}, loss={loss.item():.4f}[/]")
 
-            progress.update(task, advance=1)
+            progress.update(task, advance=1, loss=loss_val)
 
     transformer.save_pretrained(output_dir)
 
-    del transformer, pipe, optimizer
+    del transformer, optimizer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
-def _training_step(pipe, transformer, image, caption, device, dtype) -> torch.Tensor:
-    """Single training step — encode image, add noise, predict, compute loss."""
-    from torchvision import transforms
+# ---------------------------------------------------------------------------
+# Image-only training: fallback for Tier 3 datasets (style only, no motion)
+# ---------------------------------------------------------------------------
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
+def _run_image_training(
+    config: LoRATrainingConfig,
+    dataset: TrainingDataset,
+    output_dir: Path,
+) -> None:
+    """Train LoRA on image data only (no video temporal learning).
+
+    Uses image reconstruction: encode image through VAE as a single-frame
+    "video", then train the denoising objective. Teaches visual style but
+    not motion. Prints a clear warning about the limitation.
+    """
+    console.print(
+        "[yellow]Warning:[/] Image-only training mode. The model will learn visual "
+        "style but NOT motion/temporal coherence. Use a video dataset (pusa, cinematic, "
+        "pexels) for full quality."
+    )
+
+    from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+    from diffusers.models import WanTransformer3DModel
+    from transformers import AutoTokenizer
+    from peft import LoraConfig, get_peft_model
+    import torchvision.transforms as T
+
+    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    device = _get_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32,
+        cache_dir=str(MODELS_DIR),
+    )
+    vae.to(device)
+    vae.eval()
+    vae.requires_grad_(False)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
+    )
+
+    from transformers import UMT5EncoderModel
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        model_id, subfolder="text_encoder", torch_dtype=dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    text_encoder.to(device)
+    text_encoder.eval()
+    text_encoder.requires_grad_(False)
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id, subfolder="transformer", torch_dtype=dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    transformer.to(device)
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
+    )
+
+    lora_config = LoraConfig(
+        r=config.rank,
+        lora_alpha=config.alpha,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        lora_dropout=0.05,
+    )
+    transformer = get_peft_model(transformer, lora_config)
+    transformer.train()
+
+    optimizer = torch.optim.AdamW(
+        [p for p in transformer.parameters() if p.requires_grad],
+        lr=config.learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+    )
+
+    image_transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
+        T.Normalize([0.5], [0.5]),
     ])
 
-    image_tensor = transform(image).unsqueeze(0).to(device, dtype=dtype)
+    # Pre-encode images as single-frame "videos"
+    console.print("  [dim]Pre-encoding images through VAE...[/]")
+    latents_cache: list[torch.Tensor] = []
+    text_cache: list[torch.Tensor] = []
 
-    noise = torch.randn_like(image_tensor)
-    timesteps = torch.randint(0, 1000, (1,), device=device)
+    for frame_path, caption in zip(dataset.frame_paths, dataset.captions):
+        img = Image.open(frame_path).convert("RGB")
+        img_tensor = image_transform(img).to(device)
+        # Single frame as [B, C, 1, H, W] for VAE
+        img_input = img_tensor.unsqueeze(0).unsqueeze(2)
 
-    noisy = image_tensor + noise * (timesteps.float() / 1000).view(-1, 1, 1, 1)
+        with torch.no_grad():
+            latent_dist = vae.encode(img_input)
+            latent = latent_dist.latent_dist.sample() * vae.config.scaling_factor
+        latents_cache.append(latent.squeeze(0).cpu())
 
-    loss = torch.nn.functional.mse_loss(noisy, image_tensor)
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_cache.append(text_embed.squeeze(0).cpu())
 
-    return loss
+    del vae, text_encoder
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    num_train_timesteps = scheduler.config.get("num_train_timesteps", 1000)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[loss]:.4f}[/]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Training LoRA (image)", total=config.num_train_steps, loss=0.0)
+
+        for step in range(config.num_train_steps):
+            idx = step % len(latents_cache)
+
+            latents = latents_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            text_emb = text_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+
+            # [B, C, 1, H, W] -> [B, 1, C, H, W]
+            latents = latents.permute(0, 2, 1, 3, 4)
+            batch_size = latents.shape[0]
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, num_train_timesteps, (batch_size,), device=device).long()
+
+            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = sigmas.view(-1, 1, 1, 1, 1)
+            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+
+            model_output = transformer(
+                hidden_states=noisy_latents,
+                encoder_hidden_states=text_emb,
+                timestep=timesteps,
+                return_dict=False,
+            )[0]
+
+            target = latents - noise
+            loss = torch.nn.functional.mse_loss(model_output, target)
+            loss_val = loss.item()
+
+            loss = loss / config.gradient_accumulation_steps
+            loss.backward()
+
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), config.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if (step + 1) % config.save_every_n_steps == 0:
+                checkpoint_dir = output_dir / f"checkpoint-{step + 1}"
+                checkpoint_dir.mkdir(exist_ok=True)
+                transformer.save_pretrained(checkpoint_dir)
+
+            progress.update(task, advance=1, loss=loss_val)
+
+    transformer.save_pretrained(output_dir)
+
+    del transformer, optimizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
-def _find_latest_checkpoint(output_dir: Path) -> Path:
-    """Find the most recent checkpoint in the output directory."""
-    checkpoints = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
-    if checkpoints:
-        weights = checkpoints[-1] / "pytorch_lora_weights.safetensors"
-        if weights.exists():
-            return weights
-        adapter = checkpoints[-1] / "adapter_model.safetensors"
-        if adapter.exists():
-            return adapter
-    return output_dir
+# ---------------------------------------------------------------------------
+# Video loading utilities
+# ---------------------------------------------------------------------------
 
+def _load_video_as_tensor(
+    video_path: Path,
+    num_frames: int,
+    height: int,
+    width: int,
+) -> torch.Tensor | None:
+    """Load a video file as a tensor of shape [F, C, H, W] normalized to [-1, 1].
+
+    Tries decord first (fast), falls back to torchvision, then to ffmpeg+PIL.
+    """
+    try:
+        return _load_video_decord(video_path, num_frames, height, width)
+    except Exception:
+        pass
+
+    try:
+        return _load_video_torchvision(video_path, num_frames, height, width)
+    except Exception:
+        pass
+
+    try:
+        return _load_video_ffmpeg(video_path, num_frames, height, width)
+    except Exception:
+        return None
+
+
+def _load_video_decord(
+    video_path: Path, num_frames: int, height: int, width: int,
+) -> torch.Tensor:
+    """Load video with decord (fastest option)."""
+    import decord
+    decord.bridge.set_bridge("torch")
+
+    vr = decord.VideoReader(str(video_path), width=width, height=height)
+    total_frames = len(vr)
+    indices = _sample_frame_indices(total_frames, num_frames)
+    frames = vr.get_batch(indices)  # [F, H, W, C]
+    frames = frames.permute(0, 3, 1, 2).float() / 127.5 - 1.0  # normalize to [-1, 1]
+    return frames
+
+
+def _load_video_torchvision(
+    video_path: Path, num_frames: int, height: int, width: int,
+) -> torch.Tensor:
+    """Load video with torchvision.io."""
+    import torchvision
+    import torchvision.transforms as T
+
+    reader = torchvision.io.VideoReader(str(video_path), "video")
+    frames_list = []
+    for frame in reader:
+        frames_list.append(frame["data"])
+        if len(frames_list) >= num_frames * 3:
+            break
+
+    if not frames_list:
+        raise ValueError("No frames read")
+
+    all_frames = torch.stack(frames_list)  # [N, C, H, W]
+    indices = _sample_frame_indices(len(all_frames), num_frames)
+    selected = all_frames[indices]
+
+    resize = T.Resize((height, width), antialias=True)
+    selected = resize(selected)
+    selected = selected.float() / 127.5 - 1.0
+    return selected
+
+
+def _load_video_ffmpeg(
+    video_path: Path, num_frames: int, height: int, width: int,
+) -> torch.Tensor:
+    """Load video by extracting frames with ffmpeg (universal fallback)."""
+    import tempfile
+    import torchvision.transforms as T
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="rv_frames_"))
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vf", f"scale={width}:{height},fps=8",
+        str(tmpdir / "frame_%04d.png"),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    frame_files = sorted(tmpdir.glob("frame_*.png"))
+    if not frame_files:
+        raise ValueError("ffmpeg extracted no frames")
+
+    indices = _sample_frame_indices(len(frame_files), num_frames)
+    transform = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
+
+    frames = []
+    for idx in indices:
+        img = Image.open(frame_files[idx]).convert("RGB")
+        frames.append(transform(img))
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return torch.stack(frames)  # [F, C, H, W]
+
+
+def _sample_frame_indices(total_frames: int, num_frames: int) -> list[int]:
+    """Uniformly sample num_frames indices from total_frames."""
+    if total_frames <= num_frames:
+        return list(range(total_frames)) + [total_frames - 1] * (num_frames - total_frames)
+    step = total_frames / num_frames
+    return [int(i * step) for i in range(num_frames)]
+
+
+# ---------------------------------------------------------------------------
+# Metadata & utilities
+# ---------------------------------------------------------------------------
 
 def _save_training_metadata(
     config: LoRATrainingConfig,
     dataset: TrainingDataset,
     output_dir: Path,
 ) -> None:
-    """Save training config and dataset info alongside the weights."""
     metadata = {
         "lora_name": config.lora_name,
         "rank": config.rank,
@@ -271,10 +928,24 @@ def _save_training_metadata(
         "learning_rate": config.learning_rate,
         "num_train_steps": config.num_train_steps,
         "model_size": config.model_size,
-        "num_training_samples": len(dataset.video_paths),
-        "training_captions": dataset.captions,
+        "num_frames": config.num_frames,
+        "tier": dataset.tier,
+        "num_video_samples": len(dataset.video_paths),
+        "num_image_samples": len(dataset.frame_paths) - len(dataset.video_paths),
+        "total_samples": len(dataset.frame_paths),
+        "training_captions": dataset.captions[:20],
     }
     (output_dir / "training_metadata.json").write_text(json.dumps(metadata, indent=2))
+
+
+def _find_latest_checkpoint(output_dir: Path) -> Path:
+    checkpoints = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
+    if checkpoints:
+        for name in ("pytorch_lora_weights.safetensors", "adapter_model.safetensors"):
+            weights = checkpoints[-1] / name
+            if weights.exists():
+                return weights
+    return output_dir
 
 
 def list_available_loras() -> list[dict]:

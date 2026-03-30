@@ -37,6 +37,7 @@ class PipelineConfig(BaseModel):
     gdrive_path: Path | None = None
     anecdote_file: Path | None = None
     dataset_name: str | None = None
+    remote_url: str | None = None  # URL of hosted inference server (NodeOps, etc.)
 
 
 def ensure_dirs() -> None:

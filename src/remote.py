@@ -1,26 +1,192 @@
-"""Remote GPU dispatcher — offload GPU work to Google Colab via Google Drive sync.
+"""Remote GPU dispatcher — two modes:
 
-Flow:
-1. Local CLI writes a job (config.json + data) to Google Drive
-2. Colab notebook picks it up, runs GPU inference, writes results
-3. Local CLI polls for completion and downloads results
-
-Requires: Google Drive desktop app syncing ~/Google Drive/
-or manual gdrive path configuration.
+1. **Google Drive/Colab** (--colab): sync jobs via Google Drive
+2. **HTTP inference** (--remote <url>): call a hosted Wan2.1 endpoint
+   (NodeOps CreateOS, RunPod, or any server running `src/serve.py`)
 """
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import time
 import uuid
 from pathlib import Path
 
+from PIL import Image
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
+
+
+# ============================================================================
+# HTTP remote inference (NodeOps / any hosted endpoint)
+# ============================================================================
+
+class RemoteInferenceClient:
+    """Client for the repovideo FastAPI inference server (src/serve.py)."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self._check_connection()
+
+    def _check_connection(self) -> None:
+        import urllib.request
+        try:
+            resp = urllib.request.urlopen(f"{self.base_url}/health", timeout=10)
+            data = json.loads(resp.read())
+            console.print(f"  [green]Connected[/] to remote GPU: {data.get('model_id', '?')}")
+            console.print(f"  [dim]Device: {data.get('device')}, VRAM: {data.get('vram_used_gb', '?')}/{data.get('vram_total_gb', '?')} GB[/]")
+            if data.get("lora"):
+                console.print(f"  [dim]LoRA loaded: {data['lora']}[/]")
+        except Exception as e:
+            raise ConnectionError(
+                f"Cannot reach inference server at {self.base_url}/health — {e}\n"
+                "Make sure the server is running (see Dockerfile.serve or src/serve.py)"
+            )
+
+    def generate_video(
+        self,
+        image_path: Path,
+        prompt: str,
+        output_path: Path,
+        num_frames: int = 25,
+        width: int = 720,
+        height: int = 480,
+    ) -> Path:
+        """Send an image + prompt to the remote server, receive mp4 bytes back."""
+        import urllib.request
+        from urllib.parse import urlencode
+
+        console.print(f"  [dim]Sending to remote GPU: {prompt[:60]}...[/]")
+
+        img_bytes = image_path.read_bytes()
+
+        boundary = uuid.uuid4().hex
+        body = _build_multipart_body(boundary, {
+            "prompt": prompt,
+            "num_frames": str(num_frames),
+            "width": str(width),
+            "height": str(height),
+        }, {"image": (image_path.name, img_bytes, "image/png")})
+
+        req = urllib.request.Request(
+            f"{self.base_url}/generate",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        start = time.time()
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            video_bytes = resp.read()
+            elapsed = time.time() - start
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(video_bytes)
+        console.print(f"  [green]Received[/] {len(video_bytes)/1024:.0f} KB in {elapsed:.1f}s")
+        return output_path
+
+    def generate_keyframes(
+        self,
+        prompts: list[str],
+        output_dir: Path,
+        width: int = 720,
+        height: int = 480,
+    ) -> list[Path]:
+        """Generate keyframe images on the remote server."""
+        import urllib.request
+        import zipfile
+
+        boundary = uuid.uuid4().hex
+        body = _build_multipart_body(boundary, {
+            "prompts": json.dumps(prompts),
+            "width": str(width),
+            "height": str(height),
+        }, {})
+
+        req = urllib.request.Request(
+            f"{self.base_url}/keyframes",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            zip_bytes = resp.read()
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in sorted(zf.namelist()):
+                if name.endswith(".png"):
+                    dest = output_dir / name
+                    dest.write_bytes(zf.read(name))
+                    paths.append(dest)
+
+        return paths
+
+    def upload_lora(self, lora_dir: Path, name: str = "uploaded_lora") -> None:
+        """Zip and upload LoRA weights to the remote server."""
+        import urllib.request
+
+        zip_buf = io.BytesIO()
+        import zipfile
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            for f in lora_dir.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f.relative_to(lora_dir))
+        zip_bytes = zip_buf.getvalue()
+
+        boundary = uuid.uuid4().hex
+        body = _build_multipart_body(
+            boundary,
+            {"name": name},
+            {"file": ("lora.zip", zip_bytes, "application/zip")},
+        )
+
+        req = urllib.request.Request(
+            f"{self.base_url}/lora/upload",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+            console.print(f"  [green]LoRA uploaded[/] → {data.get('lora', '?')}")
+
+
+def _build_multipart_body(
+    boundary: str,
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+) -> bytes:
+    """Build a multipart/form-data body without external deps."""
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+            f"{value}\r\n".encode()
+        )
+    for key, (filename, data, content_type) in files.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n".encode()
+            + data
+            + b"\r\n"
+        )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts)
+
+
+# ============================================================================
+# Google Drive / Colab sync (existing functionality)
+# ============================================================================
 
 DEFAULT_GDRIVE_PATHS = [
     Path.home() / "Google Drive" / "My Drive",
