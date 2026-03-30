@@ -231,13 +231,23 @@ def _concat_with_crossfades(
 
 
 def _crossfade_two(a: Path, b: Path, output_path: Path, duration: float) -> None:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(a)],
+        capture_output=True, text=True,
+    )
+    try:
+        a_duration = float(probe.stdout.strip())
+    except (ValueError, AttributeError):
+        _simple_concat([a, b], output_path)
+        return
+
+    offset = max(0, a_duration - duration)
     cmd = [
         "ffmpeg", "-y",
         "-i", str(a),
         "-i", str(b),
         "-filter_complex", (
-            f"[0:v][1:v]xfade=transition=fade:duration={duration}:offset="
-            f"$(ffprobe -v error -show_entries format=duration -of csv=p=0 {a})-{duration}[v];"
+            f"[0:v][1:v]xfade=transition=fade:duration={duration}:offset={offset:.3f}[v];"
             f"[0:a][1:a]acrossfade=d={duration}[a]"
         ),
         "-map", "[v]", "-map", "[a]",
@@ -280,14 +290,26 @@ def _add_background_music(input_path: Path, output_path: Path) -> None:
         shutil.copy2(input_path, output_path)
         return
 
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(input_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        vid_duration = float(probe.stdout.strip())
+    except (ValueError, AttributeError):
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+
+    fade_out_start = max(0, vid_duration - 2)
     music_path = music_files[0]
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-i", str(music_path),
         "-filter_complex", (
-            "[1:a]volume=0.08,afade=t=in:d=2,afade=t=out:st=END-2:d=2[bg];"
-            "[0:a][bg]amix=inputs=2:duration=first[aout]"
+            f"[1:a]volume=0.08,afade=t=in:d=2,afade=t=out:st={fade_out_start:.2f}:d=2[bg];"
+            f"[0:a][bg]amix=inputs=2:duration=first[aout]"
         ),
         "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy",
