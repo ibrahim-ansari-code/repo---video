@@ -77,6 +77,21 @@ def train_lora(config: LoRATrainingConfig) -> Path:
     if config.reference_dir is None:
         raise ValueError("Provide --train-lora <dir> or --dataset <name>")
 
+    # Auto-detect VRAM and warn/downgrade for 14B on small GPUs
+    if config.model_size == "14B" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        vram_gb = getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1024**3
+        if vram_gb < 45:
+            console.print(
+                f"[yellow]Warning:[/] 14B model needs ~40 GB VRAM for training "
+                f"(you have {vram_gb:.0f} GB). Downgrading to 1.3B."
+            )
+            config.model_size = "1.3B"
+        elif vram_gb < 80:
+            console.print(
+                f"[dim]VRAM: {vram_gb:.0f} GB — tight for 14B, using staged loading[/]"
+            )
+
     console.print(f"[bold blue]Starting LoRA training[/] from {config.reference_dir}")
 
     dataset = _prepare_dataset(config)
@@ -184,15 +199,7 @@ def _run_video_training(
 ) -> None:
     """Train LoRA with actual video data through the full Wan2.1 pipeline.
 
-    The core loop:
-      for each step:
-        1. Load video frames -> encode through VAE -> video_latents
-        2. Encode caption through T5 -> text_embeds
-        3. Encode first frame through CLIP -> image_embeds
-        4. Sample noise + timestep, add noise to latents
-        5. Forward transformer(noisy_latents, text_embeds, timestep, image_embeds)
-        6. Compute flow-matching loss: MSE(predicted_velocity, target_velocity)
-        7. Backprop through LoRA parameters only
+    Loads each encoder one at a time to avoid OOM on 40GB GPUs with 14B model.
     """
     from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
     from diffusers.models import WanTransformer3DModel
@@ -203,55 +210,117 @@ def _run_video_training(
     model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    weight_dtype = dtype
 
-    console.print(f"  [dim]Loading model components from {model_id}[/]")
+    console.print(f"  [dim]Loading model components from {model_id} (staged)[/]")
 
-    # Load components individually for memory efficiency
+    video_latents_cache: list[torch.Tensor] = []
+    text_embeds_cache: list[torch.Tensor] = []
+    image_embeds_cache: list[torch.Tensor] = []
+
+    # --- Stage A: VAE — encode all videos into latents, then free ---
+    console.print("  [dim]Stage A: Encoding videos through VAE...[/]")
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32,
         cache_dir=str(MODELS_DIR),
     )
-    vae.to(device)
-    vae.eval()
-    vae.requires_grad_(False)
+    vae.to(device).eval().requires_grad_(False)
 
+    vae_scaling = vae.config.scaling_factor
+    for i, video_path in enumerate(dataset.video_paths):
+        video_tensor = _load_video_as_tensor(
+            video_path, config.num_frames,
+            config.resolution_height, config.resolution_width,
+        )
+        if video_tensor is None:
+            video_latents_cache.append(None)
+            continue
+
+        video_tensor = video_tensor.to(device, dtype=torch.float32)
+        video_input = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)
+        with torch.no_grad():
+            video_latent = vae.encode(video_input).latent_dist.sample() * vae_scaling
+        video_latents_cache.append(video_latent.squeeze(0).cpu())
+
+        if (i + 1) % 10 == 0:
+            console.print(f"    [dim]VAE-encoded {i+1}/{len(dataset.video_paths)} videos[/]")
+
+    del vae
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Stage B: Text encoder — encode captions, then free ---
+    console.print("  [dim]Stage B: Encoding captions through UMT5...[/]")
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
     )
-
     from transformers import UMT5EncoderModel
     text_encoder = UMT5EncoderModel.from_pretrained(
-        model_id, subfolder="text_encoder", torch_dtype=weight_dtype,
+        model_id, subfolder="text_encoder", torch_dtype=dtype,
         cache_dir=str(MODELS_DIR),
     )
-    text_encoder.to(device)
-    text_encoder.eval()
-    text_encoder.requires_grad_(False)
+    text_encoder.to(device).eval().requires_grad_(False)
 
+    for caption in dataset.captions[:len(dataset.video_paths)]:
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_embeds_cache.append(text_embed.squeeze(0).cpu())
+
+    del text_encoder, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Stage C: CLIP — encode first frames, then free ---
+    console.print("  [dim]Stage C: Encoding first frames through CLIP...[/]")
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
+    )
     image_encoder = CLIPVisionModel.from_pretrained(
         model_id, subfolder="image_encoder", torch_dtype=torch.float32,
         cache_dir=str(MODELS_DIR),
     )
-    image_encoder.to(device)
-    image_encoder.eval()
-    image_encoder.requires_grad_(False)
+    image_encoder.to(device).eval().requires_grad_(False)
 
-    image_processor = CLIPImageProcessor.from_pretrained(
-        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
-    )
+    for frame_path in dataset.frame_paths[:len(dataset.video_paths)]:
+        frame_img = Image.open(frame_path).convert("RGB")
+        clip_inputs = image_processor(images=frame_img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            image_embed = image_encoder(**clip_inputs).last_hidden_state
+        image_embeds_cache.append(image_embed.squeeze(0).cpu())
 
-    transformer = WanTransformer3DModel.from_pretrained(
-        model_id, subfolder="transformer", torch_dtype=weight_dtype,
-        cache_dir=str(MODELS_DIR),
-    )
-    transformer.to(device)
+    del image_encoder, image_processor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+    # Filter out failed encodes
+    valid = [(vl, te, ie) for vl, te, ie in zip(video_latents_cache, text_embeds_cache, image_embeds_cache) if vl is not None]
+    if not valid:
+        raise ValueError("No videos could be encoded. Check your dataset has valid .mp4 files.")
+    video_latents_cache, text_embeds_cache, image_embeds_cache = zip(*valid)
+    video_latents_cache = list(video_latents_cache)
+    text_embeds_cache = list(text_embeds_cache)
+    image_embeds_cache = list(image_embeds_cache)
+
+    console.print(f"  [dim]Cached {len(video_latents_cache)} video latents[/]")
+
+    # --- Stage D: Load transformer + LoRA for training ---
+    console.print("  [dim]Stage D: Loading transformer for training...[/]")
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
     )
 
-    # Apply LoRA to the transformer
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id, subfolder="transformer", torch_dtype=dtype,
+        cache_dir=str(MODELS_DIR),
+    )
+    transformer.to(device)
+
     lora_config = LoraConfig(
         r=config.rank,
         lora_alpha=config.alpha,
@@ -275,68 +344,6 @@ def _run_video_training(
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.num_train_steps, eta_min=config.learning_rate * 0.1,
     )
-
-    # Pre-encode all videos into latent space (cache to save VRAM)
-    console.print("  [dim]Pre-encoding video latents through VAE...[/]")
-    video_latents_cache: list[torch.Tensor] = []
-    text_embeds_cache: list[torch.Tensor] = []
-    image_embeds_cache: list[torch.Tensor] = []
-
-    video_transform = T.Compose([
-        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
-        T.Normalize([0.5], [0.5]),
-    ])
-
-    for i, (video_path, frame_path, caption) in enumerate(
-        zip(dataset.video_paths, dataset.frame_paths, dataset.captions)
-    ):
-        # Encode video
-        video_tensor = _load_video_as_tensor(
-            video_path, config.num_frames,
-            config.resolution_height, config.resolution_width,
-        )
-        if video_tensor is None:
-            continue
-
-        video_tensor = video_tensor.to(device, dtype=torch.float32)
-        # VAE expects [B, C, F, H, W]
-        video_input = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)
-
-        with torch.no_grad():
-            latent_dist = vae.encode(video_input)
-            video_latent = latent_dist.latent_dist.sample()
-            video_latent = video_latent * vae.config.scaling_factor
-        video_latents_cache.append(video_latent.squeeze(0).cpu())
-
-        # Encode text
-        text_inputs = tokenizer(
-            caption, max_length=256, padding="max_length",
-            truncation=True, return_tensors="pt",
-        ).to(device)
-        with torch.no_grad():
-            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
-        text_embeds_cache.append(text_embed.squeeze(0).cpu())
-
-        # Encode image (first frame) through CLIP
-        frame_img = Image.open(frame_path).convert("RGB")
-        clip_inputs = image_processor(images=frame_img, return_tensors="pt").to(device)
-        with torch.no_grad():
-            image_embed = image_encoder(**clip_inputs).last_hidden_state
-        image_embeds_cache.append(image_embed.squeeze(0).cpu())
-
-        if (i + 1) % 10 == 0:
-            console.print(f"    [dim]Encoded {i+1}/{len(dataset.video_paths)} videos[/]")
-
-    if not video_latents_cache:
-        raise ValueError("No videos could be encoded. Check your dataset has valid .mp4 files.")
-
-    console.print(f"  [dim]Cached {len(video_latents_cache)} video latents[/]")
-
-    # Free encoders from VRAM
-    del vae, text_encoder, image_encoder
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     num_train_timesteps = scheduler.config.get("num_train_timesteps", 1000)
 
@@ -437,6 +444,8 @@ def _run_i2v_training(
     Uses image prompts as both the CLIP conditioning input and the VAE
     denoising target. The transformer learns to generate content conditioned
     on the source image via encoder_hidden_states_image.
+
+    Loads each encoder one at a time to avoid OOM on 40GB GPUs with 14B model.
     """
     from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
     from diffusers.models import WanTransformer3DModel
@@ -448,39 +457,96 @@ def _run_i2v_training(
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    console.print(f"  [dim]Loading I2V model components from {model_id}[/]")
+    console.print(f"  [dim]Loading I2V model components from {model_id} (staged)[/]")
 
+    latents_cache: list[torch.Tensor] = []
+    text_cache: list[torch.Tensor] = []
+    image_embed_cache: list[torch.Tensor] = []
+
+    image_transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
+        T.Normalize([0.5], [0.5]),
+    ])
+
+    # --- Stage A: VAE encoding (load VAE, encode all images, free VAE) ---
+    console.print("  [dim]Stage A: Encoding images through VAE...[/]")
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32,
         cache_dir=str(MODELS_DIR),
     )
-    vae.to(device)
-    vae.eval()
-    vae.requires_grad_(False)
+    vae.to(device).eval().requires_grad_(False)
 
+    vae_scaling = vae.config.scaling_factor
+    for frame_path in dataset.frame_paths:
+        img = Image.open(frame_path).convert("RGB")
+        img_tensor = image_transform(img).to(device)
+        img_input = img_tensor.unsqueeze(0).unsqueeze(2)  # [B, C, 1, H, W]
+        with torch.no_grad():
+            latent = vae.encode(img_input).latent_dist.sample() * vae_scaling
+        latents_cache.append(latent.squeeze(0).cpu())
+
+    del vae
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    console.print(f"    [dim]{len(latents_cache)} VAE latents cached[/]")
+
+    # --- Stage B: Text encoding (load tokenizer + UMT5, encode captions, free) ---
+    console.print("  [dim]Stage B: Encoding captions through UMT5...[/]")
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
     )
-
     from transformers import UMT5EncoderModel
     text_encoder = UMT5EncoderModel.from_pretrained(
         model_id, subfolder="text_encoder", torch_dtype=dtype,
         cache_dir=str(MODELS_DIR),
     )
-    text_encoder.to(device)
-    text_encoder.eval()
-    text_encoder.requires_grad_(False)
+    text_encoder.to(device).eval().requires_grad_(False)
 
+    for caption in dataset.captions:
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_cache.append(text_embed.squeeze(0).cpu())
+
+    del text_encoder, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    console.print(f"    [dim]{len(text_cache)} text embeddings cached[/]")
+
+    # --- Stage C: CLIP image encoding (load CLIP, encode images, free) ---
+    console.print("  [dim]Stage C: Encoding images through CLIP...[/]")
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
+    )
     image_encoder = CLIPVisionModel.from_pretrained(
         model_id, subfolder="image_encoder", torch_dtype=torch.float32,
         cache_dir=str(MODELS_DIR),
     )
-    image_encoder.to(device)
-    image_encoder.eval()
-    image_encoder.requires_grad_(False)
+    image_encoder.to(device).eval().requires_grad_(False)
 
-    image_processor = CLIPImageProcessor.from_pretrained(
-        model_id, subfolder="image_processor", cache_dir=str(MODELS_DIR),
+    for frame_path in dataset.frame_paths:
+        img = Image.open(frame_path).convert("RGB")
+        clip_inputs = image_processor(images=img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            image_embed = image_encoder(**clip_inputs).last_hidden_state
+        image_embed_cache.append(image_embed.squeeze(0).cpu())
+
+    del image_encoder, image_processor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    console.print(f"    [dim]{len(image_embed_cache)} CLIP embeddings cached[/]")
+
+    # --- Stage D: Load transformer + LoRA for training ---
+    console.print("  [dim]Stage D: Loading transformer for training...[/]")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
     )
 
     transformer = WanTransformer3DModel.from_pretrained(
@@ -488,10 +554,6 @@ def _run_i2v_training(
         cache_dir=str(MODELS_DIR),
     )
     transformer.to(device)
-
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
-    )
 
     lora_config = LoraConfig(
         r=config.rank,
@@ -512,49 +574,6 @@ def _run_i2v_training(
         betas=(0.9, 0.95),
         weight_decay=0.01,
     )
-
-    image_transform = T.Compose([
-        T.ToTensor(),
-        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
-        T.Normalize([0.5], [0.5]),
-    ])
-
-    # Pre-encode all images
-    console.print("  [dim]Pre-encoding I2V training pairs...[/]")
-    latents_cache: list[torch.Tensor] = []
-    text_cache: list[torch.Tensor] = []
-    image_embed_cache: list[torch.Tensor] = []
-
-    for frame_path, caption in zip(dataset.frame_paths, dataset.captions):
-        img = Image.open(frame_path).convert("RGB")
-
-        # CLIP embedding (the I2V conditioning signal)
-        clip_inputs = image_processor(images=img, return_tensors="pt").to(device)
-        with torch.no_grad():
-            image_embed = image_encoder(**clip_inputs).last_hidden_state
-        image_embed_cache.append(image_embed.squeeze(0).cpu())
-
-        # VAE latent (the denoising target)
-        img_tensor = image_transform(img).to(device)
-        img_input = img_tensor.unsqueeze(0).unsqueeze(2)  # [B, C, 1, H, W]
-        with torch.no_grad():
-            latent_dist = vae.encode(img_input)
-            latent = latent_dist.latent_dist.sample() * vae.config.scaling_factor
-        latents_cache.append(latent.squeeze(0).cpu())
-
-        # Text embedding
-        text_inputs = tokenizer(
-            caption, max_length=256, padding="max_length",
-            truncation=True, return_tensors="pt",
-        ).to(device)
-        with torch.no_grad():
-            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
-        text_cache.append(text_embed.squeeze(0).cpu())
-
-    del vae, text_encoder, image_encoder
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     console.print(f"  [dim]Cached {len(latents_cache)} I2V training pairs[/]")
 
@@ -654,36 +673,74 @@ def _run_image_training(
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
+    latents_cache: list[torch.Tensor] = []
+    text_cache: list[torch.Tensor] = []
+
+    image_transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
+        T.Normalize([0.5], [0.5]),
+    ])
+
+    # --- Stage A: VAE — encode images as single-frame "videos", then free ---
+    console.print("  [dim]Stage A: Encoding images through VAE...[/]")
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32,
         cache_dir=str(MODELS_DIR),
     )
-    vae.to(device)
-    vae.eval()
-    vae.requires_grad_(False)
+    vae.to(device).eval().requires_grad_(False)
 
+    vae_scaling = vae.config.scaling_factor
+    for frame_path in dataset.frame_paths:
+        img = Image.open(frame_path).convert("RGB")
+        img_tensor = image_transform(img).to(device)
+        img_input = img_tensor.unsqueeze(0).unsqueeze(2)  # [B, C, 1, H, W]
+        with torch.no_grad():
+            latent = vae.encode(img_input).latent_dist.sample() * vae_scaling
+        latents_cache.append(latent.squeeze(0).cpu())
+
+    del vae
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Stage B: Text encoder — encode captions, then free ---
+    console.print("  [dim]Stage B: Encoding captions through UMT5...[/]")
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, subfolder="tokenizer", cache_dir=str(MODELS_DIR),
     )
-
     from transformers import UMT5EncoderModel
     text_encoder = UMT5EncoderModel.from_pretrained(
         model_id, subfolder="text_encoder", torch_dtype=dtype,
         cache_dir=str(MODELS_DIR),
     )
-    text_encoder.to(device)
-    text_encoder.eval()
-    text_encoder.requires_grad_(False)
+    text_encoder.to(device).eval().requires_grad_(False)
+
+    for caption in dataset.captions:
+        text_inputs = tokenizer(
+            caption, max_length=256, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
+        text_cache.append(text_embed.squeeze(0).cpu())
+
+    del text_encoder, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Stage C: Load transformer + LoRA for training ---
+    console.print("  [dim]Stage C: Loading transformer for training...[/]")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
+    )
 
     transformer = WanTransformer3DModel.from_pretrained(
         model_id, subfolder="transformer", torch_dtype=dtype,
         cache_dir=str(MODELS_DIR),
     )
     transformer.to(device)
-
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model_id, subfolder="scheduler", cache_dir=str(MODELS_DIR),
-    )
 
     lora_config = LoraConfig(
         r=config.rank,
@@ -700,41 +757,6 @@ def _run_image_training(
         betas=(0.9, 0.95),
         weight_decay=0.01,
     )
-
-    image_transform = T.Compose([
-        T.ToTensor(),
-        T.Resize((config.resolution_height, config.resolution_width), antialias=True),
-        T.Normalize([0.5], [0.5]),
-    ])
-
-    # Pre-encode images as single-frame "videos"
-    console.print("  [dim]Pre-encoding images through VAE...[/]")
-    latents_cache: list[torch.Tensor] = []
-    text_cache: list[torch.Tensor] = []
-
-    for frame_path, caption in zip(dataset.frame_paths, dataset.captions):
-        img = Image.open(frame_path).convert("RGB")
-        img_tensor = image_transform(img).to(device)
-        # Single frame as [B, C, 1, H, W] for VAE
-        img_input = img_tensor.unsqueeze(0).unsqueeze(2)
-
-        with torch.no_grad():
-            latent_dist = vae.encode(img_input)
-            latent = latent_dist.latent_dist.sample() * vae.config.scaling_factor
-        latents_cache.append(latent.squeeze(0).cpu())
-
-        text_inputs = tokenizer(
-            caption, max_length=256, padding="max_length",
-            truncation=True, return_tensors="pt",
-        ).to(device)
-        with torch.no_grad():
-            text_embed = text_encoder(text_inputs.input_ids).last_hidden_state
-        text_cache.append(text_embed.squeeze(0).cpu())
-
-    del vae, text_encoder
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     num_train_timesteps = scheduler.config.get("num_train_timesteps", 1000)
 
