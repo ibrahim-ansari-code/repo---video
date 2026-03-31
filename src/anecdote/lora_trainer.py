@@ -362,9 +362,9 @@ def _run_video_training(
         for step in range(config.num_train_steps):
             idx = step % len(video_latents_cache)
 
-            latents = video_latents_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
-            text_emb = text_embeds_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
-            image_emb = image_embeds_cache[idx].unsqueeze(0).to(device, dtype=weight_dtype)
+            latents = video_latents_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            text_emb = text_embeds_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            image_emb = image_embeds_cache[idx].unsqueeze(0).to(device, dtype=dtype)
 
             # latents shape: [B, C, F, H, W] from VAE; transformer expects [B, F, C, H, W]
             latents = latents.permute(0, 2, 1, 3, 4)
@@ -378,7 +378,7 @@ def _run_video_training(
 
             # Flow matching: noisy = (1 - sigma) * x + sigma * noise
             # where sigma = timestep / num_train_timesteps
-            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = (timesteps.float() / num_train_timesteps).to(dtype=latents.dtype)
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
@@ -603,7 +603,7 @@ def _run_i2v_training(
             noise = torch.randn_like(latents)
             timesteps = torch.randint(0, num_train_timesteps, (batch_size,), device=device).long()
 
-            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = (timesteps.float() / num_train_timesteps).to(dtype=latents.dtype)
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
@@ -783,7 +783,7 @@ def _run_image_training(
             noise = torch.randn_like(latents)
             timesteps = torch.randint(0, num_train_timesteps, (batch_size,), device=device).long()
 
-            sigmas = timesteps.float() / num_train_timesteps
+            sigmas = (timesteps.float() / num_train_timesteps).to(dtype=latents.dtype)
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 

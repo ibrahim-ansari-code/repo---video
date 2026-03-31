@@ -107,8 +107,8 @@ def list_datasets():
         console.print(f"    {ds['description']}")
         console.print(f"    {ds['samples']} default samples from [dim]{ds['hf_dataset']}[/]")
         console.print()
-    console.print("[bold]Recommended:[/] Use [bold green]tip-i2v[/] (I2V tier) for best image-to-video LoRA results.")
-    console.print("[dim]Usage: repovideo generate <url> --dataset tip-i2v[/]")
+    console.print("[bold]Recommended:[/] Use [bold green]pusa[/] (VIDEO tier) for best LoRA results — real video clips with motion.")
+    console.print("[dim]Usage: repovideo generate <url> --dataset pusa[/]")
 
 
 @main.command()
