@@ -225,7 +225,7 @@ def _run_video_training(
     )
     vae.to(device).eval().requires_grad_(False)
 
-    vae_scaling = vae.config.scaling_factor
+    vae_scaling = vae.config.get("scaling_factor", 1.0) if isinstance(vae.config, dict) else getattr(vae.config, "scaling_factor", 1.0)
     for i, video_path in enumerate(dataset.video_paths):
         video_tensor = _load_video_as_tensor(
             video_path, config.num_frames,
@@ -477,7 +477,7 @@ def _run_i2v_training(
     )
     vae.to(device).eval().requires_grad_(False)
 
-    vae_scaling = vae.config.scaling_factor
+    vae_scaling = vae.config.get("scaling_factor", 1.0) if isinstance(vae.config, dict) else getattr(vae.config, "scaling_factor", 1.0)
     for frame_path in dataset.frame_paths:
         img = Image.open(frame_path).convert("RGB")
         img_tensor = image_transform(img).to(device)
@@ -690,7 +690,7 @@ def _run_image_training(
     )
     vae.to(device).eval().requires_grad_(False)
 
-    vae_scaling = vae.config.scaling_factor
+    vae_scaling = vae.config.get("scaling_factor", 1.0) if isinstance(vae.config, dict) else getattr(vae.config, "scaling_factor", 1.0)
     for frame_path in dataset.frame_paths:
         img = Image.open(frame_path).convert("RGB")
         img_tensor = image_transform(img).to(device)
