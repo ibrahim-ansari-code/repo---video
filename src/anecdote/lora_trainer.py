@@ -91,6 +91,23 @@ def _wan21_i2v_spatial_condition(
     return torch.concat([mask_lat_size, latent_condition.to(mask_lat_size.dtype)], dim=1)
 
 
+def _prepare_wan_transformer_for_lora_training(transformer, config: LoRATrainingConfig) -> None:
+    """Cut activation memory before PEFT wrap (14B I2V needs this on ~40GB GPUs)."""
+    if not config.gradient_checkpointing:
+        return
+    if not getattr(transformer, "_supports_gradient_checkpointing", False):
+        console.print(
+            "  [yellow]Warning:[/] This transformer build has no gradient checkpointing; "
+            "VRAM use will be high."
+        )
+        return
+    transformer.enable_gradient_checkpointing()
+    console.print(
+        "  [dim]Gradient checkpointing enabled (lower VRAM, slower per step). "
+        "Set gradient_checkpointing=False if you have spare memory.[/]"
+    )
+
+
 @dataclass
 class LoRATrainingConfig:
     reference_dir: Path | None = None
@@ -112,6 +129,8 @@ class LoRATrainingConfig:
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
     mixed_precision: bool = True
+    # Recompute activations during backward — required for 14B Wan I2V on ~40GB GPUs.
+    gradient_checkpointing: bool = True
 
 
 @dataclass
@@ -399,6 +418,7 @@ def _run_video_training(
         cache_dir=str(MODELS_DIR),
     )
     transformer.to(device)
+    _prepare_wan_transformer_for_lora_training(transformer, config)
 
     lora_config = LoraConfig(
         r=config.rank,
@@ -637,6 +657,7 @@ def _run_i2v_training(
         cache_dir=str(MODELS_DIR),
     )
     transformer.to(device)
+    _prepare_wan_transformer_for_lora_training(transformer, config)
 
     lora_config = LoraConfig(
         r=config.rank,
@@ -830,6 +851,7 @@ def _run_image_training(
         cache_dir=str(MODELS_DIR),
     )
     transformer.to(device)
+    _prepare_wan_transformer_for_lora_training(transformer, config)
 
     lora_config = LoraConfig(
         r=config.rank,
