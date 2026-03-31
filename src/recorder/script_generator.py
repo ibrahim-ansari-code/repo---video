@@ -23,9 +23,9 @@ class DemoScript:
     url: str = ""
 
 
-def generate_web_demo_script(manifest: RepoManifest, host_port: int) -> DemoScript:
+def generate_web_demo_script(manifest: RepoManifest, app_url: str | None = None, host_port: int | None = None) -> DemoScript:
     """Build a sequence of browser actions to demo a web app."""
-    base_url = f"http://localhost:{host_port}"
+    base_url = app_url or f"http://localhost:{host_port}"
     script = DemoScript(url=base_url)
 
     script.actions.append(DemoAction(

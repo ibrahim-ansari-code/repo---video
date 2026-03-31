@@ -32,8 +32,8 @@ from src.config import LORA_DIR, MODELS_DIR
 
 console = Console()
 
-WAN_14B_I2V = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
-WAN_1_3B_I2V = "Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers"
+WAN_I2V_720P = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
 
 @dataclass
@@ -77,19 +77,19 @@ def train_lora(config: LoRATrainingConfig) -> Path:
     if config.reference_dir is None:
         raise ValueError("Provide --train-lora <dir> or --dataset <name>")
 
-    # Auto-detect VRAM and warn/downgrade for 14B on small GPUs
+    # Auto-detect VRAM and warn/downgrade for 720P on small GPUs
     if config.model_size == "14B" and torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         vram_gb = getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1024**3
         if vram_gb < 45:
             console.print(
-                f"[yellow]Warning:[/] 14B model needs ~40 GB VRAM for training "
-                f"(you have {vram_gb:.0f} GB). Downgrading to 1.3B."
+                f"[yellow]Warning:[/] 720P mode needs ~40 GB VRAM for training "
+                f"(you have {vram_gb:.0f} GB). Switching to 480P mode."
             )
-            config.model_size = "1.3B"
+            config.model_size = "480P"
         elif vram_gb < 80:
             console.print(
-                f"[dim]VRAM: {vram_gb:.0f} GB — tight for 14B, using staged loading[/]"
+                f"[dim]VRAM: {vram_gb:.0f} GB — tight for 720P, using staged loading[/]"
             )
 
     console.print(f"[bold blue]Starting LoRA training[/] from {config.reference_dir}")
@@ -207,7 +207,7 @@ def _run_video_training(
     from peft import LoraConfig, get_peft_model
     import torchvision.transforms as T
 
-    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    model_id = WAN_I2V_720P if config.model_size == "14B" else WAN_I2V_480P
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
@@ -453,7 +453,7 @@ def _run_i2v_training(
     from peft import LoraConfig, get_peft_model
     import torchvision.transforms as T
 
-    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    model_id = WAN_I2V_720P if config.model_size == "14B" else WAN_I2V_480P
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
@@ -669,7 +669,7 @@ def _run_image_training(
     from peft import LoraConfig, get_peft_model
     import torchvision.transforms as T
 
-    model_id = WAN_14B_I2V if config.model_size == "14B" else WAN_1_3B_I2V
+    model_id = WAN_I2V_720P if config.model_size == "14B" else WAN_I2V_480P
     device = _get_device()
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 

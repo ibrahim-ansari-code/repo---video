@@ -13,7 +13,6 @@ MODELS_DIR = REPOVIDEO_HOME / "models"
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
-DOCKERFILES_DIR = TEMPLATES_DIR / "dockerfiles"
 
 DEFAULT_VIDEO_WIDTH = 1920
 DEFAULT_VIDEO_HEIGHT = 1080
@@ -29,7 +28,7 @@ class PipelineConfig(BaseModel):
     no_anecdote: bool = False
     train_lora: Path | None = None
     lora_name: str | None = None
-    model_size: str = "14B"  # "14B" or "1.3B" fallback
+    model_size: str = "14B"  # "14B" (720P) or "480P"
     width: int = DEFAULT_VIDEO_WIDTH
     height: int = DEFAULT_VIDEO_HEIGHT
     fps: int = DEFAULT_FPS

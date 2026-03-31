@@ -15,8 +15,8 @@ from src.config import MODELS_DIR, LORA_DIR, DEFAULT_FPS
 
 console = Console()
 
-WAN_14B_MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
-WAN_1_3B_MODEL_ID = "Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers"
+WAN_I2V_720P = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
 
 def generate_video_from_images(
@@ -58,7 +58,7 @@ def _load_wan_pipeline(model_size: str, lora_path: Path | None):
     from diffusers import WanImageToVideoPipeline
     from diffusers.utils import export_to_video
 
-    model_id = WAN_14B_MODEL_ID if model_size == "14B" else WAN_1_3B_MODEL_ID
+    model_id = WAN_I2V_720P if model_size == "14B" else WAN_I2V_480P
     device = _get_device()
     dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
 

@@ -1,217 +1,197 @@
-"""Stage 3: Docker Sandbox Runner — build, run, and manage containerized repos."""
+"""Stage 3: E2B Cloud Sandbox — clone, install, and run repos in isolated VMs.
+
+Uses E2B (https://e2b.dev) cloud sandboxes instead of local Docker containers.
+Each sandbox is a lightweight Firecracker microVM that boots in ~150ms with
+full Linux, network access, and port forwarding.
+
+Requires an E2B API key: set E2B_API_KEY env var or pass it explicitly.
+"""
 
 from __future__ import annotations
 
-import shutil
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import docker
-from docker.errors import BuildError, ContainerError, ImageNotFound
 from rich.console import Console
 
 from src.analyzer import ProjectType, RepoManifest, WEB_APP_TYPES
-from src.config import DOCKERFILES_DIR
 
 console = Console()
 
-RESOURCE_LIMITS = {
-    "mem_limit": "2g",
-    "cpu_period": 100_000,
-    "cpu_quota": 100_000,  # 1 CPU
-}
-
-TIMEOUT_SECONDS = 120
+SANDBOX_TIMEOUT = 300  # 5 minutes
+BOOT_WAIT_TIMEOUT = 120  # max seconds to wait for server to respond
 
 
 @dataclass
 class SandboxResult:
-    container_id: str
-    host_port: int | None
+    sandbox_id: str
+    host_url: str | None
     is_web: bool
-    run_command: str | None  # for CLI tools, the command to exec
+    run_command: str | None
+
+
+INSTALL_COMMANDS: dict[ProjectType, list[str]] = {
+    ProjectType.NEXTJS: ["npm install"],
+    ProjectType.REACT_VITE: ["npm install"],
+    ProjectType.VUE: ["npm install"],
+    ProjectType.NODE: ["npm install"],
+    ProjectType.PYTHON_FLASK: ["pip install -r requirements.txt 2>/dev/null || pip install flask"],
+    ProjectType.PYTHON_DJANGO: ["pip install -r requirements.txt 2>/dev/null || pip install django"],
+    ProjectType.PYTHON_FASTAPI: ["pip install -r requirements.txt 2>/dev/null || pip install fastapi uvicorn"],
+    ProjectType.PYTHON_GENERIC: ["pip install -r requirements.txt 2>/dev/null || true"],
+    ProjectType.RUST: ["cargo build --release 2>/dev/null || true"],
+    ProjectType.GO: ["go build ./... 2>/dev/null || true"],
+}
+
+START_COMMANDS: dict[ProjectType, str] = {
+    ProjectType.NEXTJS: "npx next dev -p 3000",
+    ProjectType.REACT_VITE: "npx vite --host 0.0.0.0 --port 3000",
+    ProjectType.VUE: "npx vue-cli-service serve --port 3000",
+    ProjectType.NODE: "npm start",
+    ProjectType.PYTHON_FLASK: "python -m flask run --host=0.0.0.0 --port=8000",
+    ProjectType.PYTHON_DJANGO: "python manage.py runserver 0.0.0.0:8000",
+    ProjectType.PYTHON_FASTAPI: "uvicorn main:app --host 0.0.0.0 --port 8000",
+}
 
 
 class Sandbox:
-    def __init__(self, manifest: RepoManifest):
+    def __init__(self, manifest: RepoManifest, api_key: str | None = None):
         self.manifest = manifest
-        self.client = docker.from_env()
-        self.container = None
-        self.image_tag = f"repovideo-{manifest.name}:latest"
-
-    def _generate_dockerfile(self) -> str:
-        """Build a Dockerfile string for the detected project type."""
-        pt = self.manifest.project_type
-
-        if pt == ProjectType.DOCKER:
-            existing = self.manifest.clone_dir / "Dockerfile"
-            if existing.exists():
-                return existing.read_text()
-
-        template_map = {
-            ProjectType.NEXTJS: "node.Dockerfile",
-            ProjectType.REACT_VITE: "node.Dockerfile",
-            ProjectType.VUE: "node.Dockerfile",
-            ProjectType.NODE: "node.Dockerfile",
-            ProjectType.PYTHON_FLASK: "python.Dockerfile",
-            ProjectType.PYTHON_DJANGO: "python.Dockerfile",
-            ProjectType.PYTHON_FASTAPI: "python.Dockerfile",
-            ProjectType.PYTHON_GENERIC: "python.Dockerfile",
-            ProjectType.RUST: "rust.Dockerfile",
-            ProjectType.GO: "go.Dockerfile",
-        }
-
-        template_name = template_map.get(pt)
-        if template_name is None:
-            return self._fallback_dockerfile()
-
-        template_path = DOCKERFILES_DIR / template_name
-        if not template_path.exists():
-            return self._fallback_dockerfile()
-
-        content = template_path.read_text()
-        content = self._customize_dockerfile(content, pt)
-        return content
-
-    def _customize_dockerfile(self, content: str, pt: ProjectType) -> str:
-        """Adjust the template Dockerfile for the specific project."""
-        port = self.manifest.port
-
-        if pt == ProjectType.REACT_VITE:
-            content = content.replace("EXPOSE 3000", f"EXPOSE {port}")
-            content = content.replace('CMD ["npm", "start"]', f'CMD ["npx", "vite", "--host", "0.0.0.0", "--port", "{port}"]')
-        elif pt == ProjectType.NEXTJS:
-            content = content.replace('CMD ["npm", "start"]', 'CMD ["npx", "next", "dev", "-p", "3000"]')
-        elif pt == ProjectType.VUE:
-            content = content.replace('CMD ["npm", "start"]', 'CMD ["npx", "vue-cli-service", "serve", "--port", "3000"]')
-        elif pt == ProjectType.PYTHON_FASTAPI:
-            content = content.replace(
-                'CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=8000"]',
-                'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]',
+        self.api_key = api_key or os.environ.get("E2B_API_KEY")
+        if not self.api_key:
+            raise RuntimeError(
+                "E2B API key required. Set E2B_API_KEY env var or pass --e2b-key.\n"
+                "Get a free key at https://e2b.dev"
             )
-        elif pt == ProjectType.PYTHON_DJANGO:
-            content = content.replace(
-                'CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=8000"]',
-                'CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]',
-            )
-
-        return content
-
-    def _fallback_dockerfile(self) -> str:
-        return (
-            "FROM ubuntu:22.04\n"
-            "WORKDIR /app\n"
-            "COPY . .\n"
-            'CMD ["bash"]\n'
-        )
-
-    def build(self) -> None:
-        """Write the Dockerfile into the clone dir and build the image."""
-        dockerfile_content = self._generate_dockerfile()
-        dockerfile_path = self.manifest.clone_dir / "Dockerfile.repovideo"
-        dockerfile_path.write_text(dockerfile_content)
-
-        console.print(f"[bold blue]Building[/] Docker image [bold]{self.image_tag}[/]")
-        try:
-            self.client.images.build(
-                path=str(self.manifest.clone_dir),
-                dockerfile="Dockerfile.repovideo",
-                tag=self.image_tag,
-                rm=True,
-            )
-        except BuildError as e:
-            console.print(f"[bold red]Build failed:[/] {e}")
-            raise
+        self._sandbox = None
 
     def start(self) -> SandboxResult:
-        """Run the container, returning connection details."""
+        """Create an E2B sandbox, clone the repo, install deps, and start the app."""
+        from e2b import Sandbox as E2BSandbox
+
         is_web = self.manifest.project_type in WEB_APP_TYPES
         port = self.manifest.port
 
-        run_kwargs = {
-            "image": self.image_tag,
-            "detach": True,
-            "remove": False,
-            **RESOURCE_LIMITS,
-        }
+        console.print(f"[bold blue]Creating[/] E2B sandbox for [bold]{self.manifest.name}[/]")
 
+        self._sandbox = E2BSandbox.create(
+            api_key=self.api_key,
+            timeout=SANDBOX_TIMEOUT,
+        )
+
+        console.print(f"  [dim]Sandbox ID: {self._sandbox.sandbox_id}[/]")
+
+        self._clone_repo()
+        self._install_deps()
+
+        host_url = None
         if is_web:
-            run_kwargs["ports"] = {f"{port}/tcp": None}
-
-        console.print(f"[bold blue]Starting[/] container for [bold]{self.manifest.name}[/]")
-        self.container = self.client.containers.run(**run_kwargs)
-
-        host_port = None
-        if is_web:
-            host_port = self._wait_for_port(port)
-            console.print(f"[bold green]Ready[/] at http://localhost:{host_port}")
+            self._start_server(port)
+            host_url = self._get_public_url(port)
+            console.print(f"[bold green]Ready[/] at {host_url}")
 
         return SandboxResult(
-            container_id=self.container.id,
-            host_port=host_port,
+            sandbox_id=self._sandbox.sandbox_id,
+            host_url=host_url,
             is_web=is_web,
             run_command=self.manifest.run_command if not is_web else None,
         )
 
-    def _wait_for_port(self, container_port: int, timeout: int = TIMEOUT_SECONDS) -> int:
-        """Poll until the container's port mapping is available and the server responds."""
-        import urllib.request
-        import urllib.error
+    def _clone_repo(self) -> None:
+        """Clone the repo inside the sandbox."""
+        console.print(f"  [dim]Cloning {self.manifest.repo_url}...[/]")
+        result = self._sandbox.commands.run(
+            f"git clone --depth 1 {self.manifest.repo_url} /home/user/project",
+            timeout=60,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Clone failed: {result.stderr}")
 
-        deadline = time.time() + timeout
-        host_port = None
+    def _install_deps(self) -> None:
+        """Install project dependencies based on detected type."""
+        pt = self.manifest.project_type
+        commands = INSTALL_COMMANDS.get(pt, [])
+
+        if not commands:
+            return
+
+        console.print(f"  [dim]Installing dependencies ({pt.value})...[/]")
+        for cmd in commands:
+            result = self._sandbox.commands.run(
+                cmd,
+                timeout=120,
+                cwd="/home/user/project",
+            )
+            if result.exit_code != 0:
+                console.print(f"  [yellow]Warning:[/] '{cmd}' exited with {result.exit_code}")
+
+    def _start_server(self, port: int) -> None:
+        """Start the web server as a background process."""
+        pt = self.manifest.project_type
+        start_cmd = START_COMMANDS.get(pt)
+
+        if start_cmd is None:
+            start_cmd = self.manifest.run_command or "npm start"
+
+        console.print(f"  [dim]Starting server: {start_cmd}[/]")
+        self._sandbox.commands.run(
+            f"cd /home/user/project && {start_cmd} &",
+            timeout=5,
+        )
+
+        self._wait_for_server(port)
+
+    def _wait_for_server(self, port: int) -> None:
+        """Poll until the server inside the sandbox is responding."""
+        console.print(f"  [dim]Waiting for port {port}...[/]")
+        deadline = time.time() + BOOT_WAIT_TIMEOUT
 
         while time.time() < deadline:
-            self.container.reload()
-            ports = self.container.ports
-            mapping = ports.get(f"{container_port}/tcp")
-            if mapping:
-                host_port = int(mapping[0]["HostPort"])
-                break
-            time.sleep(1)
-
-        if host_port is None:
-            raise TimeoutError(f"Container port {container_port} not mapped after {timeout}s")
-
-        while time.time() < deadline:
-            try:
-                urllib.request.urlopen(f"http://localhost:{host_port}", timeout=2)
-                return host_port
-            except (urllib.error.URLError, ConnectionError, OSError):
-                time.sleep(2)
+            result = self._sandbox.commands.run(
+                f"curl -sf http://localhost:{port}/ -o /dev/null -w '%{{http_code}}'",
+                timeout=5,
+            )
+            if result.exit_code == 0:
+                return
+            time.sleep(2)
 
         console.print("[yellow]Warning:[/] Server may not be fully ready, proceeding anyway")
-        return host_port
+
+    def _get_public_url(self, port: int) -> str:
+        """Get the public URL for a port exposed from the sandbox."""
+        host = self._sandbox.get_host(port)
+        return f"https://{host}"
 
     def exec_command(self, command: str) -> tuple[int, str]:
-        """Execute a command inside the running container."""
-        if self.container is None:
-            raise RuntimeError("Container not started")
-        exit_code, output = self.container.exec_run(command, demux=True)
-        stdout = output[0].decode() if output[0] else ""
-        stderr = output[1].decode() if output[1] else ""
-        return exit_code, stdout + stderr
+        """Execute a command inside the running sandbox."""
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not started")
+        result = self._sandbox.commands.run(
+            command,
+            timeout=30,
+            cwd="/home/user/project",
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.exit_code, output
 
     def get_logs(self) -> str:
-        if self.container is None:
+        """Get recent output from the sandbox."""
+        if self._sandbox is None:
             return ""
-        return self.container.logs().decode(errors="ignore")
+        result = self._sandbox.commands.run("cat /tmp/server.log 2>/dev/null || true", timeout=5)
+        return result.stdout or ""
 
     def stop(self) -> None:
-        """Stop and remove the container."""
-        if self.container:
+        """Kill the E2B sandbox."""
+        if self._sandbox:
             try:
-                self.container.stop(timeout=5)
-                self.container.remove(force=True)
+                self._sandbox.kill()
             except Exception:
                 pass
-            self.container = None
+            self._sandbox = None
 
     def cleanup(self) -> None:
-        """Full cleanup: stop container + remove clone dir."""
+        """Full cleanup — just stop the sandbox (E2B handles the rest)."""
         self.stop()
-        try:
-            self.client.images.remove(self.image_tag, force=True)
-        except Exception:
-            pass

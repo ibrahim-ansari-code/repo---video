@@ -54,14 +54,14 @@ def cli_manifest():
 
 class TestWebDemoScript:
     def test_generates_actions(self, web_manifest):
-        script = generate_web_demo_script(web_manifest, 3000)
+        script = generate_web_demo_script(web_manifest, app_url="http://localhost:3000")
         assert len(script.actions) > 0
         assert script.url == "http://localhost:3000"
         action_types = [a.action for a in script.actions]
         assert "navigate" in action_types
 
     def test_includes_routes_from_readme(self, web_manifest):
-        script = generate_web_demo_script(web_manifest, 3000)
+        script = generate_web_demo_script(web_manifest, app_url="http://localhost:3000")
         nav_values = [a.value for a in script.actions if a.action == "navigate"]
         assert any("dashboard" in v for v in nav_values)
 

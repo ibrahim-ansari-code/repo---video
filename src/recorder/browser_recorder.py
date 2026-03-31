@@ -18,14 +18,14 @@ console = Console()
 
 async def record_web_demo(
     manifest: RepoManifest,
-    host_port: int,
+    app_url: str,
     output_path: Path,
     duration: int = 60,
     width: int = DEFAULT_VIDEO_WIDTH,
     height: int = DEFAULT_VIDEO_HEIGHT,
 ) -> Path:
-    """Record a browser demo of a web app running on the given port."""
-    script = generate_web_demo_script(manifest, host_port)
+    """Record a browser demo of a web app at the given URL."""
+    script = generate_web_demo_script(manifest, app_url=app_url)
     video_dir = Path(tempfile.mkdtemp(prefix="repovideo_browser_"))
 
     console.print(f"[bold blue]Recording[/] browser demo → {output_path}")
@@ -130,9 +130,9 @@ def _convert_webm_to_mp4(input_path: Path, output_path: Path) -> None:
 
 def run_web_recording(
     manifest: RepoManifest,
-    host_port: int,
+    app_url: str,
     output_path: Path,
     duration: int = 60,
 ) -> Path:
     """Synchronous wrapper around the async recording function."""
-    return asyncio.run(record_web_demo(manifest, host_port, output_path, duration))
+    return asyncio.run(record_web_demo(manifest, app_url, output_path, duration))

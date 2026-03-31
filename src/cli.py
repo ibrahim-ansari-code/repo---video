@@ -31,7 +31,7 @@ def main(ctx):
 @click.option("--no-anecdote", is_flag=True, help="Skip AI anecdote generation")
 @click.option("--train-lora", type=click.Path(exists=True), help="Dir of reference videos to fine-tune LoRA")
 @click.option("--lora-name", default=None, help="Name for the LoRA adapter (or existing one to load)")
-@click.option("--model-size", type=click.Choice(["14B", "1.3B"]), default="14B", help="Wan2.1 model size")
+@click.option("--model-size", type=click.Choice(["14B", "480P"]), default="14B", help="Wan2.1 I2V resolution (both use 14B weights)")
 @click.option("--width", default=1920, help="Output video width")
 @click.option("--height", default=1080, help="Output video height")
 @click.option("--colab", is_flag=True, help="Offload GPU work to Google Colab via Google Drive")
@@ -165,11 +165,10 @@ def _run_pipeline(config: PipelineConfig) -> None:
         else:
             lora_path = _train_lora(config)
 
-    # --- Stage 3: Sandbox ---
-    console.rule("[bold]Stage 3: Running in Sandbox")
+    # --- Stage 3: Sandbox (E2B cloud) ---
+    console.rule("[bold]Stage 3: Running in E2B Sandbox")
     sandbox = Sandbox(manifest)
     try:
-        sandbox.build()
         sandbox_result = sandbox.start()
 
         # --- Stage 4: Record ---
@@ -178,7 +177,7 @@ def _run_pipeline(config: PipelineConfig) -> None:
 
         if sandbox_result.is_web:
             from src.recorder.browser_recorder import run_web_recording
-            run_web_recording(manifest, sandbox_result.host_port, demo_path, config.demo_duration)
+            run_web_recording(manifest, sandbox_result.host_url, demo_path, config.demo_duration)
         else:
             from src.recorder.terminal_recorder import record_cli_demo
             record_cli_demo(manifest, sandbox.exec_command, demo_path, config.demo_duration)
@@ -465,7 +464,7 @@ def _train_lora_via_colab(config: PipelineConfig) -> Path | None:
 @main.command()
 @click.option("--host", default="0.0.0.0", help="Bind host")
 @click.option("--port", default=8000, help="Bind port")
-@click.option("--model-size", type=click.Choice(["14B", "1.3B"]), default="1.3B", help="Wan2.1 model size")
+@click.option("--model-size", type=click.Choice(["14B", "480P"]), default="480P", help="Wan2.1 I2V resolution")
 @click.option("--lora-path", default=None, help="Path to LoRA weights to load")
 def serve(host: str, port: int, model_size: str, lora_path: str | None):
     """Start the inference server (for NodeOps / remote GPU hosting)."""
@@ -509,9 +508,9 @@ def deploy_info():
    - Go to [cyan]https://createos.nodeops.network/deploy/docker[/]
    - Select Docker Image deployment
    - Enter your image URL
-   - Select a GPU instance (A10G for 1.3B model, A100 for 14B)
+   - Select a GPU instance (A10G for 480P mode, A100 for 14B/720P)
    - Set environment variables:
-     [dim]REPOVIDEO_MODEL_SIZE=1.3B[/]
+     [dim]REPOVIDEO_MODEL_SIZE=480P[/]
      [dim]REPOVIDEO_LORA_PATH=/loras/your_style[/]  (optional)
    - Expose port [bold]8000[/]
    - Click Deploy
@@ -526,8 +525,8 @@ def deploy_info():
      --remote https://your-app.nodeops.network
 
 [bold]Pricing (NodeOps GPU):[/]
-   A10G (24 GB, good for 1.3B): ~$0.60/hr
-   A100 (80 GB, needed for 14B): ~$2.50/hr
+   A10G (24 GB, good for 480P): ~$0.60/hr
+   A100 (80 GB, needed for 720P): ~$2.50/hr
    Pay-per-second billing, auto-scaling available.
 """)
 

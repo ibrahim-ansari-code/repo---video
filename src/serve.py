@@ -39,12 +39,12 @@ try:
 except ImportError:
     FastAPI = None  # type: ignore
 
-MODEL_SIZE = os.environ.get("REPOVIDEO_MODEL_SIZE", "1.3B")
+MODEL_SIZE = os.environ.get("REPOVIDEO_MODEL_SIZE", "480P")
 LORA_PATH = os.environ.get("REPOVIDEO_LORA_PATH", "")
 CACHE_DIR = os.environ.get("REPOVIDEO_CACHE_DIR", "/models")
 
-WAN_14B_I2V = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
-WAN_1_3B_I2V = "Wan-AI/Wan2.1-I2V-1.3B-720P-Diffusers"
+WAN_I2V_720P = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
 _pipeline = None
 _sdxl_pipeline = None
@@ -52,7 +52,7 @@ _model_info: dict = {}
 
 
 def _get_model_id() -> str:
-    return WAN_14B_I2V if MODEL_SIZE == "14B" else WAN_1_3B_I2V
+    return WAN_I2V_720P if MODEL_SIZE == "14B" else WAN_I2V_480P
 
 
 def _load_i2v_pipeline():

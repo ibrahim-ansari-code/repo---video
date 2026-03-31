@@ -7,6 +7,7 @@ to verify the pipeline wiring works end-to-end.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -63,7 +64,7 @@ class TestAnalyzerIntegration:
 
 
 class TestSandboxIntegration:
-    def test_dockerfile_generation(self, fake_web_repo):
+    def test_sandbox_requires_api_key(self, fake_web_repo):
         from src.sandbox import Sandbox
 
         manifest = RepoManifest(
@@ -75,30 +76,35 @@ class TestSandboxIntegration:
             port=3000,
             is_web_app=True,
         )
-        with patch("src.sandbox.docker") as mock_docker:
-            mock_docker.from_env.return_value = MagicMock()
-            sandbox = Sandbox(manifest)
-            dockerfile = sandbox._generate_dockerfile()
-        assert "node" in dockerfile.lower()
-        assert "npm install" in dockerfile.lower() or "npm" in dockerfile.lower()
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("E2B_API_KEY", None)
+            with pytest.raises(RuntimeError, match="E2B API key"):
+                Sandbox(manifest)
 
-    def test_cli_dockerfile_generation(self, fake_cli_repo):
+    def test_sandbox_accepts_api_key(self, fake_web_repo):
         from src.sandbox import Sandbox
 
         manifest = RepoManifest(
             repo_url="https://github.com/user/test",
-            clone_dir=fake_cli_repo,
-            project_type=ProjectType.RUST,
+            clone_dir=fake_web_repo,
+            project_type=ProjectType.NEXTJS,
             name="test",
             description="test",
-            port=0,
-            is_web_app=False,
+            port=3000,
+            is_web_app=True,
         )
-        with patch("src.sandbox.docker") as mock_docker:
-            mock_docker.from_env.return_value = MagicMock()
-            sandbox = Sandbox(manifest)
-            dockerfile = sandbox._generate_dockerfile()
-        assert "rust" in dockerfile.lower()
+        sandbox = Sandbox(manifest, api_key="e2b_test_key_123")
+        assert sandbox.api_key == "e2b_test_key_123"
+
+    def test_install_commands_for_project_types(self):
+        from src.sandbox import INSTALL_COMMANDS, START_COMMANDS
+
+        assert ProjectType.NEXTJS in INSTALL_COMMANDS
+        assert "npm install" in INSTALL_COMMANDS[ProjectType.NEXTJS]
+        assert ProjectType.NEXTJS in START_COMMANDS
+        assert "next" in START_COMMANDS[ProjectType.NEXTJS]
+        assert ProjectType.PYTHON_FASTAPI in START_COMMANDS
+        assert "uvicorn" in START_COMMANDS[ProjectType.PYTHON_FASTAPI]
 
 
 class TestScriptGeneratorIntegration:
@@ -117,7 +123,7 @@ class TestScriptGeneratorIntegration:
             usage_examples=["npm install\nnpm run dev"],
             demo_hints=["Getting Started"],
         )
-        script = generate_web_demo_script(manifest, 3000)
+        script = generate_web_demo_script(manifest, app_url="http://localhost:3000")
         assert len(script.actions) > 0
         nav_values = [a.value for a in script.actions if a.action == "navigate"]
         assert any("dashboard" in v for v in nav_values)
@@ -157,9 +163,9 @@ class TestConfigValidation:
             output_path=Path("custom.mp4"),
             demo_duration=30,
             no_anecdote=True,
-            model_size="1.3B",
+            model_size="480P",
         )
         assert config.output_path == Path("custom.mp4")
         assert config.demo_duration == 30
         assert config.no_anecdote is True
-        assert config.model_size == "1.3B"
+        assert config.model_size == "480P"
