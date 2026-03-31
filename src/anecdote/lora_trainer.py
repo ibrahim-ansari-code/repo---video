@@ -36,6 +36,61 @@ WAN_I2V_720P = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
 
+def _retrieve_vae_latents(encoder_output, sample_mode: str = "sample") -> torch.Tensor:
+    """Match diffusers WanImageToVideoPipeline.retrieve_latents."""
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample()
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    if hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    raise AttributeError("Could not access latents of VAE encoder output")
+
+
+def _wan21_i2v_spatial_condition(
+    vae,
+    first_frame_bchw: torch.Tensor,
+    num_pixel_frames: int,
+) -> torch.Tensor:
+    """Extra channels for Wan I2V (mask + normalized cond latent), [B, 20, F_lat, H_lat, W_lat].
+
+    Transformer expects hidden_states = cat([noisy_latents (16ch), this], dim=1) -> 36 channels.
+    Mirrors ``WanImageToVideoPipeline.prepare_latents`` when expand_timesteps is False.
+    first_frame_bchw: [B, 3, H, W] same value range as pixels passed to ``vae.encode`` for video (typically [-1, 1]).
+    """
+    device = first_frame_bchw.device
+    batch_size, _, height, width = first_frame_bchw.shape
+    cfg = vae.config
+    z_dim = cfg.z_dim
+    sft = getattr(cfg, "scale_factor_temporal", None) or 4
+    sfs = getattr(cfg, "scale_factor_spatial", None) or 8
+    latent_h = height // sfs
+    latent_w = width // sfs
+
+    image = first_frame_bchw.unsqueeze(2).to(device=device, dtype=vae.dtype)
+    tail = first_frame_bchw.new_zeros(batch_size, 3, num_pixel_frames - 1, height, width).to(
+        device=device, dtype=vae.dtype
+    )
+    video_condition = torch.cat([image, tail], dim=2)
+
+    latent_condition = _retrieve_vae_latents(vae.encode(video_condition), "argmax").float()
+
+    lm = torch.tensor(cfg.latents_mean, device=device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
+    lstd = torch.tensor(cfg.latents_std, device=device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
+    latent_condition = (latent_condition - lm) * (1.0 / lstd)
+
+    mask_lat_size = torch.ones(
+        batch_size, 1, num_pixel_frames, latent_h, latent_w,
+        dtype=torch.float32, device=device,
+    )
+    mask_lat_size[:, :, list(range(1, num_pixel_frames))] = 0
+    first_frame_mask = mask_lat_size[:, :, 0:1]
+    first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=sft)
+    mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
+    mask_lat_size = mask_lat_size.view(batch_size, -1, sft, latent_h, latent_w).transpose(1, 2)
+    return torch.concat([mask_lat_size, latent_condition.to(mask_lat_size.dtype)], dim=1)
+
+
 @dataclass
 class LoRATrainingConfig:
     reference_dir: Path | None = None
@@ -224,6 +279,7 @@ def _run_video_training(
     console.print(f"  [dim]Loading model components from {model_id} (staged)[/]")
 
     video_latents_cache: list[torch.Tensor] = []
+    i2v_condition_cache: list[torch.Tensor] = []
     text_embeds_cache: list[torch.Tensor] = []
     image_embeds_cache: list[torch.Tensor] = []
 
@@ -243,6 +299,7 @@ def _run_video_training(
         )
         if video_tensor is None:
             video_latents_cache.append(None)
+            i2v_condition_cache.append(None)
             continue
 
         video_tensor = video_tensor.to(device, dtype=torch.float32)
@@ -250,6 +307,11 @@ def _run_video_training(
         with torch.no_grad():
             video_latent = vae.encode(video_input).latent_dist.sample() * vae_scaling
         video_latents_cache.append(video_latent.squeeze(0).cpu())
+
+        first_bchw = video_tensor[0:1]
+        with torch.no_grad():
+            cond = _wan21_i2v_spatial_condition(vae, first_bchw, config.num_frames)
+        i2v_condition_cache.append(cond.squeeze(0).cpu())
 
         if (i + 1) % 10 == 0:
             console.print(f"    [dim]VAE-encoded {i+1}/{len(dataset.video_paths)} videos[/]")
@@ -309,11 +371,18 @@ def _run_video_training(
         torch.cuda.empty_cache()
 
     # Filter out failed encodes
-    valid = [(vl, te, ie) for vl, te, ie in zip(video_latents_cache, text_embeds_cache, image_embeds_cache) if vl is not None]
+    valid = [
+        (vl, ic, te, ie)
+        for vl, ic, te, ie in zip(
+            video_latents_cache, i2v_condition_cache, text_embeds_cache, image_embeds_cache,
+        )
+        if vl is not None and ic is not None
+    ]
     if not valid:
         raise ValueError("No videos could be encoded. Check your dataset has valid .mp4 files.")
-    video_latents_cache, text_embeds_cache, image_embeds_cache = zip(*valid)
+    video_latents_cache, i2v_condition_cache, text_embeds_cache, image_embeds_cache = zip(*valid)
     video_latents_cache = list(video_latents_cache)
+    i2v_condition_cache = list(i2v_condition_cache)
     text_embeds_cache = list(text_embeds_cache)
     image_embeds_cache = list(image_embeds_cache)
 
@@ -391,10 +460,11 @@ def _run_video_training(
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
-            # I2V conditioning: pass first-frame CLIP embeddings so the model
-            # learns to generate video conditioned on the source image
+            cond = i2v_condition_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            hidden_in = torch.cat([noisy_latents, cond], dim=1)
+
             model_output = transformer(
-                hidden_states=noisy_latents,
+                hidden_states=hidden_in,
                 encoder_hidden_states=text_emb,
                 encoder_hidden_states_image=image_emb,
                 timestep=timesteps,
@@ -469,6 +539,7 @@ def _run_i2v_training(
     console.print(f"  [dim]Loading I2V model components from {model_id} (staged)[/]")
 
     latents_cache: list[torch.Tensor] = []
+    i2v_condition_cache: list[torch.Tensor] = []
     text_cache: list[torch.Tensor] = []
     image_embed_cache: list[torch.Tensor] = []
 
@@ -494,6 +565,9 @@ def _run_i2v_training(
         with torch.no_grad():
             latent = vae.encode(img_input).latent_dist.sample() * vae_scaling
         latents_cache.append(latent.squeeze(0).cpu())
+        with torch.no_grad():
+            cond = _wan21_i2v_spatial_condition(vae, img_tensor.unsqueeze(0), num_pixel_frames=1)
+        i2v_condition_cache.append(cond.squeeze(0).cpu())
 
     del vae
     gc.collect()
@@ -615,8 +689,11 @@ def _run_i2v_training(
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
+            cond = i2v_condition_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            hidden_in = torch.cat([noisy_latents, cond], dim=1)
+
             model_output = transformer(
-                hidden_states=noisy_latents,
+                hidden_states=hidden_in,
                 encoder_hidden_states=text_emb,
                 encoder_hidden_states_image=image_emb,
                 timestep=timesteps,
@@ -682,6 +759,7 @@ def _run_image_training(
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     latents_cache: list[torch.Tensor] = []
+    i2v_condition_cache: list[torch.Tensor] = []
     text_cache: list[torch.Tensor] = []
 
     image_transform = T.Compose([
@@ -706,6 +784,9 @@ def _run_image_training(
         with torch.no_grad():
             latent = vae.encode(img_input).latent_dist.sample() * vae_scaling
         latents_cache.append(latent.squeeze(0).cpu())
+        with torch.no_grad():
+            cond = _wan21_i2v_spatial_condition(vae, img_tensor.unsqueeze(0), num_pixel_frames=1)
+        i2v_condition_cache.append(cond.squeeze(0).cpu())
 
     del vae
     gc.collect()
@@ -793,8 +874,11 @@ def _run_image_training(
             sigmas = sigmas.view(-1, 1, 1, 1, 1)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
+            cond = i2v_condition_cache[idx].unsqueeze(0).to(device, dtype=dtype)
+            hidden_in = torch.cat([noisy_latents, cond], dim=1)
+
             model_output = transformer(
-                hidden_states=noisy_latents,
+                hidden_states=hidden_in,
                 encoder_hidden_states=text_emb,
                 timestep=timesteps,
                 return_dict=False,
