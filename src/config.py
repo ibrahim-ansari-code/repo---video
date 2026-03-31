@@ -36,6 +36,7 @@ class PipelineConfig(BaseModel):
     gdrive_path: Path | None = None
     anecdote_file: Path | None = None
     dataset_name: str | None = None
+    dataset_max_samples: int | None = None  # built-in dataset sample cap (smoke tests)
     remote_url: str | None = None  # URL of hosted inference server (NodeOps, etc.)
 
 

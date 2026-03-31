@@ -32,6 +32,7 @@ dependencies = [
 train = [
     "torchvision>=0.17",
     "decord>=0.6",
+    "yt-dlp>=2024.1",
 ]
 serve = [
     "fastapi>=0.110",

@@ -37,8 +37,16 @@ def main(ctx):
 @click.option("--colab", is_flag=True, help="Offload GPU work to Google Colab via Google Drive")
 @click.option("--gdrive-path", type=click.Path(), default=None, help="Path to Google Drive sync folder")
 @click.option("--anecdote-file", type=click.Path(exists=True), default=None, help="Use a pre-made anecdote video (e.g. from Colab)")
-@click.option("--dataset", type=click.Choice(["tip-i2v", "pusa", "cinematic", "pexels", "developer", "dramatic"]),
-              default=None, help="Built-in HF dataset to train LoRA on (instead of --train-lora)")
+@click.option(
+    "--dataset",
+    type=click.Choice(
+        ["tip-i2v", "pusa", "cinematic", "pexels", "youtube-commons", "developer", "dramatic"]
+    ),
+    default=None,
+    help="Built-in HF dataset to train LoRA on (instead of --train-lora)",
+)
+@click.option("--dataset-max-samples", type=int, default=None,
+              help="Max samples to download from built-in dataset (e.g. 8 for a quick test)")
 @click.option("--remote", default=None, help="URL of a remote GPU inference server (NodeOps, RunPod, etc.)")
 def generate(
     repo_url: str,
@@ -54,6 +62,7 @@ def generate(
     gdrive_path: str | None,
     anecdote_file: str | None,
     dataset: str | None,
+    dataset_max_samples: int | None,
     remote: str | None,
 ):
     """Generate a demo video from a GitHub repo URL."""
@@ -73,6 +82,7 @@ def generate(
         gdrive_path=Path(gdrive_path) if gdrive_path else None,
         anecdote_file=Path(anecdote_file) if anecdote_file else None,
         dataset_name=dataset,
+        dataset_max_samples=dataset_max_samples,
         remote_url=remote,
     )
 
@@ -290,6 +300,7 @@ def _train_lora(config: PipelineConfig) -> Path | None:
         training_config = LoRATrainingConfig(
             reference_dir=config.train_lora,
             dataset_name=config.dataset_name,
+            dataset_max_samples=config.dataset_max_samples,
             lora_name=lora_name,
             model_size=config.model_size,
         )

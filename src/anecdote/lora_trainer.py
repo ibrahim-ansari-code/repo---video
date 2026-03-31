@@ -40,6 +40,7 @@ WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 class LoRATrainingConfig:
     reference_dir: Path | None = None
     dataset_name: str | None = None
+    dataset_max_samples: int | None = None  # cap built-in dataset download (quick Colab smoke tests)
     lora_name: str = "custom_style"
     rank: int = 32
     alpha: int = 32
@@ -72,7 +73,11 @@ def train_lora(config: LoRATrainingConfig) -> Path:
     if config.dataset_name and not config.reference_dir:
         from src.anecdote.datasets import download_dataset, get_dataset_tier
         console.print(f"[bold blue]Downloading[/] built-in dataset: {config.dataset_name}")
-        config.reference_dir = download_dataset(config.dataset_name)
+        dl_kwargs: dict = {}
+        if config.dataset_max_samples is not None:
+            dl_kwargs["max_samples"] = config.dataset_max_samples
+            console.print(f"  [dim]Limiting to {config.dataset_max_samples} samples (smoke test)[/]")
+        config.reference_dir = download_dataset(config.dataset_name, **dl_kwargs)
 
     if config.reference_dir is None:
         raise ValueError("Provide --train-lora <dir> or --dataset <name>")
@@ -95,6 +100,11 @@ def train_lora(config: LoRATrainingConfig) -> Path:
     console.print(f"[bold blue]Starting LoRA training[/] from {config.reference_dir}")
 
     dataset = _prepare_dataset(config)
+    if config.dataset_max_samples is not None:
+        n = config.dataset_max_samples
+        dataset.frame_paths = dataset.frame_paths[:n]
+        dataset.video_paths = dataset.video_paths[:n]
+        dataset.captions = dataset.captions[:n]
     if len(dataset.frame_paths) == 0:
         raise ValueError(f"No valid training data found in {config.reference_dir}")
 
@@ -366,9 +376,8 @@ def _run_video_training(
             text_emb = text_embeds_cache[idx].unsqueeze(0).to(device, dtype=dtype)
             image_emb = image_embeds_cache[idx].unsqueeze(0).to(device, dtype=dtype)
 
-            # latents shape: [B, C, F, H, W] from VAE; transformer expects [B, F, C, H, W]
-            latents = latents.permute(0, 2, 1, 3, 4)
-            batch_size, num_frames, num_channels, height, width = latents.shape
+            # WanTransformer3DModel expects [B, C, F, H, W] (same as VAE latent layout).
+            batch_size = latents.shape[0]
 
             noise = torch.randn_like(latents)
 
@@ -596,8 +605,7 @@ def _run_i2v_training(
             text_emb = text_cache[idx].unsqueeze(0).to(device, dtype=dtype)
             image_emb = image_embed_cache[idx].unsqueeze(0).to(device, dtype=dtype)
 
-            # [B, C, 1, H, W] -> [B, 1, C, H, W]
-            latents = latents.permute(0, 2, 1, 3, 4)
+            # WanTransformer3DModel expects [B, C, F, H, W]; single-frame latents are [B, C, 1, H, W].
             batch_size = latents.shape[0]
 
             noise = torch.randn_like(latents)
@@ -776,8 +784,6 @@ def _run_image_training(
             latents = latents_cache[idx].unsqueeze(0).to(device, dtype=dtype)
             text_emb = text_cache[idx].unsqueeze(0).to(device, dtype=dtype)
 
-            # [B, C, 1, H, W] -> [B, 1, C, H, W]
-            latents = latents.permute(0, 2, 1, 3, 4)
             batch_size = latents.shape[0]
 
             noise = torch.randn_like(latents)

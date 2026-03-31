@@ -11,6 +11,8 @@ Three tiers of training data, from best (video) to easiest (image-only):
   Tier 2 — Video-from-URL datasets (downloads video URLs from metadata):
     "pexels"      — jovianzm/Pexels-400k: stock video thumbnails/URLs filtered
                     by visual style keywords (cinematic, dramatic, etc.)
+    "youtube-commons" — PleIAs/YouTube-Commons: CC-BY YouTube transcripts + links;
+                    streams parquet shards and uses yt-dlp to grab short clips (slow; small N recommended).
 
   Tier 3 — Image-only datasets (still images + synthetic captions):
     "developer"   — Pexels filtered for tech/dev scenes (keyboard, screen, code)
@@ -25,6 +27,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -80,6 +84,18 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "sunset", "city", "nature", "ocean", "clouds",
         ],
         "download_fn": "_download_pexels_videos",
+    },
+    "youtube-commons": {
+        "hf_dataset": "PleIAs/YouTube-Commons",
+        "tier": "video",
+        "description": (
+            "CC-BY YouTube corpus (transcripts + video_link). Streams parquet shards, "
+            "downloads ~12s clips via yt-dlp. Use a small NUM_SAMPLES (8–32) first; many URLs fail or rate-limit."
+        ),
+        "num_samples": 16,
+        "max_samples": 2000,
+        "parquet_shards": 8,
+        "download_fn": "_download_youtube_commons_videos",
     },
     "cinematic": {
         "hf_dataset": "CinematicT2vData/cinepile_captions",
@@ -164,13 +180,34 @@ def download_dataset(
 
     marker = output_dir / ".downloaded"
     if marker.exists():
-        existing_videos = list(output_dir.glob("*.mp4"))
-        existing_images = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
-        total = len(existing_videos) + len(existing_images)
-        if total >= max(num_samples // 4, 1):
-            console.print(f"  [dim]Using cached dataset: {output_dir} ({total} files)[/]")
-            return output_dir
-        else:
+        try:
+            prev_meta = json.loads(marker.read_text())
+            prev_n = prev_meta.get("samples")
+        except (json.JSONDecodeError, TypeError):
+            prev_n = None
+        if prev_n is not None and prev_n != num_samples:
+            console.print(
+                f"  [dim]Sample count changed ({prev_n} → {num_samples}), clearing cache...[/]"
+            )
+            for p in output_dir.glob("*.mp4"):
+                p.unlink(missing_ok=True)
+            for p in output_dir.glob("frame_*.png"):
+                p.unlink(missing_ok=True)
+            for p in output_dir.glob("*.jpg"):
+                if not p.stem.startswith("frame_"):
+                    p.unlink(missing_ok=True)
+            for p in output_dir.glob("sample_*.png"):
+                p.unlink(missing_ok=True)
+            (output_dir / "captions.json").unlink(missing_ok=True)
+        if marker.exists() and prev_n is not None and prev_n != num_samples:
+            marker.unlink()
+        if marker.exists():
+            existing_videos = list(output_dir.glob("*.mp4"))
+            existing_images = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
+            total = len(existing_videos) + len(existing_images)
+            if total >= max(num_samples // 4, 1):
+                console.print(f"  [dim]Using cached dataset: {output_dir} ({total} files)[/]")
+                return output_dir
             console.print(f"  [dim]Stale cache ({total} files), re-downloading...[/]")
             marker.unlink()
 
@@ -452,6 +489,169 @@ def _download_cinematic_videos(cfg: dict, output_dir: Path, num_samples: int) ->
             except Exception:
                 video_path.unlink(missing_ok=True)
                 continue
+
+    (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: YouTube-Commons — CC-BY transcripts + yt-dlp short clips
+# ---------------------------------------------------------------------------
+
+def _youtube_commons_watch_url(row: dict) -> str | None:
+    link = (row.get("video_link") or "").strip()
+    if link and ("youtube.com" in link or "youtu.be" in link):
+        return link
+    vid = (row.get("video_id") or "").strip()
+    if vid and len(vid) >= 8:
+        return f"https://www.youtube.com/watch?v={vid}"
+    return None
+
+
+def _yt_dlp_section(max_seconds: int) -> str:
+    """Build yt-dlp ``--download-sections`` range for the first ``max_seconds`` seconds."""
+    if max_seconds <= 0:
+        max_seconds = 12
+    m, s = divmod(max_seconds, 60)
+    return f"*0:00-{int(m)}:{s:02d}"
+
+
+def _yt_dlp_download_clip(url: str, dest: Path, max_seconds: int, timeout: int) -> bool:
+    """Download the first ``max_seconds`` of a video with yt-dlp. Returns True on success."""
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        raise RuntimeError(
+            "yt-dlp not found on PATH. Install with: pip install 'repovideo[train]' or pip install yt-dlp"
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    section = _yt_dlp_section(max_seconds)
+    out_tmpl = str(dest.with_suffix("")) + ".%(ext)s"
+    cmd = [
+        ytdlp,
+        "--no-playlist",
+        "--no-warnings",
+        "--socket-timeout", "30",
+        "--retries", "2",
+        "--fragment-retries", "2",
+        "-f", "bv*[height<=720][ext=mp4]+ba/b[height<=720][ext=mp4]/bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--download-sections", section,
+        "-o", out_tmpl,
+        url,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        cmd_fb = [
+            ytdlp,
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout", "30",
+            "--retries", "1",
+            "-f", "best[ext=mp4][height<=720]/best[ext=mp4]/best",
+            "--download-sections", section,
+            "-o", out_tmpl,
+            url,
+        ]
+        r = subprocess.run(cmd_fb, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        return False
+    for ext in ("mp4", "webm", "mkv"):
+        p = dest.with_suffix(f".{ext}")
+        if p.exists() and p.stat().st_size > 2000:
+            if p != dest:
+                p.rename(dest)
+            return True
+    base = dest.with_suffix("")
+    for p in dest.parent.glob(base.name + ".*"):
+        if p.suffix.lower() in (".mp4", ".webm", ".mkv") and p.stat().st_size > 2000:
+            p.rename(dest)
+            return True
+    return False
+
+
+def _caption_from_youtube_commons_row(row: dict, max_chars: int = 600) -> str:
+    title = (row.get("title") or "").strip()
+    text = (row.get("text") or "").strip().replace("\n", " ")
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    parts = [p for p in (title, text) if p]
+    return ". ".join(parts) if parts else "A YouTube video clip, natural motion, documentary style."
+
+
+def _download_youtube_commons_videos(cfg: dict, output_dir: Path, num_samples: int) -> None:
+    """Stream YouTube-Commons parquet shards and download short clips with yt-dlp."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+
+    repo = cfg["hf_dataset"]
+    n_shards = min(int(cfg.get("parquet_shards", 8)), 50)
+    data_files = [f"hf://datasets/{repo}/cctube_{i}.parquet" for i in range(n_shards)]
+
+    console.print(
+        f"  [dim]Streaming {n_shards} parquet shard(s) from {repo} (yt-dlp clips)...[/]"
+    )
+
+    ds = load_dataset("parquet", data_files=data_files, split="train", streaming=True)
+
+    max_sec = int(os.environ.get("REPOVIDEO_YTC_CLIP_SECONDS", "12"))
+    timeout = int(os.environ.get("REPOVIDEO_YTC_TIMEOUT", "180"))
+    require_en = cfg.get("require_english", False)
+
+    collected = 0
+    captions: dict[str, str] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("YouTube-Commons + yt-dlp", total=num_samples)
+
+        for row in ds:
+            if collected >= num_samples:
+                break
+
+            if require_en and (row.get("original_language") or "").lower() not in ("en", "english"):
+                continue
+
+            url = _youtube_commons_watch_url(row)
+            if not url:
+                continue
+
+            caption = _caption_from_youtube_commons_row(row)
+            if len(caption) < 15:
+                continue
+
+            filename = f"ytc_{collected:04d}.mp4"
+            video_path = output_dir / filename
+
+            try:
+                if not _yt_dlp_download_clip(url, video_path, max_sec, timeout):
+                    continue
+                if not video_path.exists() or video_path.stat().st_size < 3000:
+                    video_path.unlink(missing_ok=True)
+                    continue
+
+                _trim_video(video_path, max_seconds=float(max_sec) + 1.0)
+                _extract_first_frame_ffmpeg(video_path, output_dir)
+                captions[filename] = caption
+                collected += 1
+                progress.update(task, completed=collected)
+            except subprocess.TimeoutExpired:
+                video_path.unlink(missing_ok=True)
+                continue
+            except Exception:
+                video_path.unlink(missing_ok=True)
+                continue
+
+    if collected == 0:
+        raise RuntimeError(
+            "No videos downloaded from YouTube-Commons. Check yt-dlp is installed, "
+            "you are not IP-blocked by YouTube, and try a smaller NUM_SAMPLES or different shards."
+        )
 
     (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
 
