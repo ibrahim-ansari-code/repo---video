@@ -166,10 +166,13 @@ def download_dataset(
     if marker.exists():
         existing_videos = list(output_dir.glob("*.mp4"))
         existing_images = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
-        if len(existing_videos) >= num_samples // 2 or len(existing_images) >= num_samples // 2:
-            total = len(existing_videos) + len(existing_images)
+        total = len(existing_videos) + len(existing_images)
+        if total >= max(num_samples // 4, 1):
             console.print(f"  [dim]Using cached dataset: {output_dir} ({total} files)[/]")
             return output_dir
+        else:
+            console.print(f"  [dim]Stale cache ({total} files), re-downloading...[/]")
+            marker.unlink()
 
     console.print(f"[bold blue]Downloading[/] '{dataset_name}' ({cfg['tier']} tier, {num_samples} samples)")
 
@@ -283,17 +286,48 @@ def _download_tip_i2v(cfg: dict, output_dir: Path, num_samples: int) -> None:
 def _download_pusa_videos(cfg: dict, output_dir: Path, num_samples: int) -> None:
     """Download video files and captions from the PusaV1 training dataset.
 
-    PusaV1 provides: train/*.mp4 (source videos) + metadata.csv (captions).
-    We download the mp4 files and extract first frames locally.
+    PusaV1 is a file-based HF repo (not row-based). Structure:
+      train/video_000001.mp4, train/video_000002.mp4, ...
+      metadata.csv  (columns: file_name, text)
+
+    We use huggingface_hub to list and download individual mp4 files.
     """
     try:
-        from datasets import load_dataset
+        from huggingface_hub import hf_hub_download, HfApi
     except ImportError:
-        raise RuntimeError("Install the 'datasets' library: pip install datasets")
+        raise RuntimeError("Install huggingface_hub: pip install huggingface_hub")
 
-    console.print(f"  [dim]Loading {cfg['hf_dataset']} metadata...[/]")
+    import csv
 
-    ds = load_dataset(cfg["hf_dataset"], split="train", streaming=True)
+    repo_id = cfg["hf_dataset"]
+    api = HfApi()
+
+    console.print(f"  [dim]Listing files in {repo_id}...[/]")
+
+    caption_lookup: dict[str, str] = {}
+    try:
+        meta_path = hf_hub_download(
+            repo_id=repo_id, filename="metadata.csv",
+            repo_type="dataset",
+        )
+        with open(meta_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                fname = row.get("file_name") or row.get("filename") or ""
+                text = row.get("text") or row.get("prompt") or row.get("caption") or ""
+                if fname:
+                    caption_lookup[fname] = text
+    except Exception as e:
+        console.print(f"  [yellow]Warning: Could not load metadata.csv: {e}[/]")
+
+    repo_files = api.list_repo_files(repo_id, repo_type="dataset")
+    mp4_files = sorted([f for f in repo_files if f.endswith(".mp4")])
+
+    if not mp4_files:
+        raise RuntimeError(f"No .mp4 files found in {repo_id}")
+
+    mp4_files = mp4_files[:num_samples]
+    console.print(f"  [dim]Found {len(mp4_files)} mp4 files, downloading {len(mp4_files)}...[/]")
 
     collected = 0
     captions: dict[str, str] = {}
@@ -305,33 +339,20 @@ def _download_pusa_videos(cfg: dict, output_dir: Path, num_samples: int) -> None
         TextColumn("{task.completed}/{task.total}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Downloading PusaV1 videos", total=num_samples)
+        task = progress.add_task("Downloading PusaV1 videos", total=len(mp4_files))
 
-        for row in ds:
-            if collected >= num_samples:
-                break
-
-            video_data = row.get("video")
-            caption = row.get("text") or row.get("prompt") or row.get("caption") or ""
-
-            if video_data is None:
-                continue
-
-            filename = f"pusa_{collected:04d}.mp4"
-            video_path = output_dir / filename
-
+        for remote_path in mp4_files:
             try:
-                if isinstance(video_data, dict) and "bytes" in video_data:
-                    video_path.write_bytes(video_data["bytes"])
-                elif isinstance(video_data, dict) and "path" in video_data:
-                    import shutil
-                    shutil.copy2(video_data["path"], video_path)
-                elif isinstance(video_data, bytes):
-                    video_path.write_bytes(video_data)
-                elif isinstance(video_data, str):
-                    _download_file(video_data, video_path)
-                else:
-                    continue
+                local_path = hf_hub_download(
+                    repo_id=repo_id, filename=remote_path,
+                    repo_type="dataset",
+                )
+
+                filename = f"pusa_{collected:04d}.mp4"
+                video_path = output_dir / filename
+
+                import shutil
+                shutil.copy2(local_path, video_path)
 
                 if not video_path.exists() or video_path.stat().st_size < 1000:
                     video_path.unlink(missing_ok=True)
@@ -339,14 +360,18 @@ def _download_pusa_videos(cfg: dict, output_dir: Path, num_samples: int) -> None
 
                 _extract_first_frame_ffmpeg(video_path, output_dir)
 
+                caption = caption_lookup.get(remote_path, "")
                 if not caption:
-                    caption = f"A smooth cinematic video clip, high quality, Wan-generated"
+                    base = Path(remote_path).stem
+                    caption = caption_lookup.get(base, "")
+                if not caption:
+                    caption = "A smooth cinematic video clip, high quality, Wan-generated"
                 captions[filename] = caption
 
                 collected += 1
                 progress.update(task, completed=collected)
-            except Exception:
-                video_path.unlink(missing_ok=True)
+            except Exception as e:
+                console.print(f"  [dim]Skipping {remote_path}: {e}[/]")
                 continue
 
     (output_dir / "captions.json").write_text(json.dumps(captions, indent=2))
