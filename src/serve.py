@@ -31,6 +31,8 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from src.anecdote.video_gen import WAN_I2V_NEGATIVE_PROMPT
+
 # FastAPI is imported lazily at startup but we want the module to be importable
 # even without it installed (for type checking, tests, etc.)
 try:
@@ -159,7 +161,7 @@ def create_app() -> "FastAPI":
         num_frames: int = Form(25),
         width: int = Form(720),
         height: int = Form(480),
-        num_inference_steps: int = Form(30),
+        num_inference_steps: int = Form(40),
         guidance_scale: float = Form(5.0),
     ):
         """Generate a video from an input image + motion prompt.
@@ -178,6 +180,7 @@ def create_app() -> "FastAPI":
         output = _pipeline(
             image=img,
             prompt=prompt,
+            negative_prompt=WAN_I2V_NEGATIVE_PROMPT,
             num_frames=num_frames,
             width=width,
             height=height,

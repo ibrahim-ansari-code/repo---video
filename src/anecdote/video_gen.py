@@ -18,6 +18,23 @@ console = Console()
 WAN_I2V_720P = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 WAN_I2V_480P = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
+# Official Wan I2V example negative prompt (trimmed). Omitting this leaves CFG with an empty negative and hurts quality.
+WAN_I2V_NEGATIVE_PROMPT = (
+    "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, "
+    "overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, "
+    "poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
+    "still picture, messy background, three legs, many people in the background, walking backwards"
+)
+
+
+def _wan_inference_dtype(device: str) -> torch.dtype:
+    """Wan 14B is trained/evaluated in bf16; fp16 on CUDA often yields noisy or corrupted frames."""
+    if device == "cuda" and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+        return torch.bfloat16
+    if device in ("cuda", "mps"):
+        return torch.float16
+    return torch.float32
+
 
 def generate_video_from_images(
     image_paths: list[Path],
@@ -29,6 +46,7 @@ def generate_video_from_images(
     fps: int = DEFAULT_FPS,
     width: int = 720,
     height: int = 480,
+    num_inference_steps: int = 40,
 ) -> Path:
     """Generate short video clips from keyframe images, then concatenate them."""
     console.print(f"[bold blue]Generating[/] {len(image_paths)} video clips with Wan2.1 I2V")
@@ -42,7 +60,17 @@ def generate_video_from_images(
         console.print(f"  [dim]Clip {i+1}/{len(image_paths)}:[/] {motion[:60]}...")
 
         clip_path = clip_dir / f"clip_{i:03d}.mp4"
-        _generate_single_clip(pipe, img_path, motion, clip_path, num_frames, fps, width, height)
+        _generate_single_clip(
+            pipe,
+            img_path,
+            motion,
+            clip_path,
+            num_frames,
+            fps,
+            width,
+            height,
+            num_inference_steps=num_inference_steps,
+        )
         clip_paths.append(clip_path)
         console.print(f"  [green]Saved[/] {clip_path.name}")
 
@@ -60,9 +88,9 @@ def _load_wan_pipeline(model_size: str, lora_path: Path | None):
 
     model_id = WAN_I2V_720P if model_size == "14B" else WAN_I2V_480P
     device = _get_device()
-    dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
+    dtype = _wan_inference_dtype(device)
 
-    console.print(f"  [dim]Loading Wan2.1 {model_size} on {device}[/]")
+    console.print(f"  [dim]Loading Wan2.1 {model_size} on {device} ({dtype})[/]")
 
     pipe = WanImageToVideoPipeline.from_pretrained(
         model_id,
@@ -74,7 +102,9 @@ def _load_wan_pipeline(model_size: str, lora_path: Path | None):
         pipe.enable_model_cpu_offload()
         try:
             pipe.enable_vae_slicing()
-            pipe.enable_vae_tiling()
+            # Tiling can add visible seams on short 480p clips; only enable for larger spatial sizes.
+            if width * height > 960 * 540:
+                pipe.enable_vae_tiling()
         except AttributeError:
             pass
     else:
@@ -96,6 +126,8 @@ def _generate_single_clip(
     fps: int,
     width: int,
     height: int,
+    *,
+    num_inference_steps: int = 40,
 ) -> None:
     """Generate a single video clip from an image + motion prompt."""
     from diffusers.utils import export_to_video
@@ -105,10 +137,11 @@ def _generate_single_clip(
     output = pipe(
         image=image,
         prompt=prompt,
+        negative_prompt=WAN_I2V_NEGATIVE_PROMPT,
         num_frames=num_frames,
         width=width,
         height=height,
-        num_inference_steps=30,
+        num_inference_steps=num_inference_steps,
         guidance_scale=5.0,
     )
 
@@ -128,21 +161,33 @@ def _concatenate_clips(clip_paths: list[Path], output_path: Path) -> None:
             f.write(f"file '{clip}'\n")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
+    # Stream copy avoids a second lossy encode when all clips share the same codec.
+    cmd_copy = [
         "ffmpeg", "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
+        "-c", "copy",
         "-movflags", "+faststart",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd_copy, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
+        cmd_reencode = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file),
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd_reencode, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
 
 
 def _get_device() -> str:
