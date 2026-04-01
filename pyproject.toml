@@ -19,6 +19,7 @@ dependencies = [
     "rich>=13.0",
     "litellm>=1.30",
     "diffusers>=0.30",
+    "ftfy>=6.1",  # Wan I2V pipeline calls ftfy in prompt cleaning; diffusers only imports it if present
     "transformers>=4.40",
     "accelerate>=0.30",
     "peft>=0.11",
