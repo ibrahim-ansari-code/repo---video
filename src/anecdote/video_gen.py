@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 from rich.console import Console
 
+from src.anecdote.lora_inference_utils import load_wan_peft_lora_state_dict
 from src.config import MODELS_DIR, LORA_DIR, DEFAULT_FPS
 
 console = Console()
@@ -54,7 +55,7 @@ def generate_video_from_images(
     clip_dir = Path(tempfile.mkdtemp(prefix="repovideo_clips_"))
     clip_paths: list[Path] = []
 
-    pipe = _load_wan_pipeline(model_size, lora_path)
+    pipe = _load_wan_pipeline(model_size, lora_path, vae_pixel_width=width, vae_pixel_height=height)
 
     for i, (img_path, motion) in enumerate(zip(image_paths, motion_prompts)):
         console.print(f"  [dim]Clip {i+1}/{len(image_paths)}:[/] {motion[:60]}...")
@@ -81,10 +82,15 @@ def generate_video_from_images(
     return output_path
 
 
-def _load_wan_pipeline(model_size: str, lora_path: Path | None):
+def _load_wan_pipeline(
+    model_size: str,
+    lora_path: Path | None,
+    *,
+    vae_pixel_width: int = 720,
+    vae_pixel_height: int = 480,
+):
     """Load the Wan2.1 I2V pipeline with optional LoRA weights."""
     from diffusers import WanImageToVideoPipeline
-    from diffusers.utils import export_to_video
 
     model_id = WAN_I2V_720P if model_size == "14B" else WAN_I2V_480P
     device = _get_device()
@@ -103,7 +109,7 @@ def _load_wan_pipeline(model_size: str, lora_path: Path | None):
         try:
             pipe.enable_vae_slicing()
             # Tiling can add visible seams on short 480p clips; only enable for larger spatial sizes.
-            if width * height > 960 * 540:
+            if vae_pixel_width * vae_pixel_height > 960 * 540:
                 pipe.enable_vae_tiling()
         except AttributeError:
             pass
@@ -112,7 +118,11 @@ def _load_wan_pipeline(model_size: str, lora_path: Path | None):
 
     if lora_path and lora_path.exists():
         console.print(f"  [dim]Loading LoRA weights from {lora_path}[/]")
-        pipe.load_lora_weights(str(lora_path))
+        try:
+            lora_sd = load_wan_peft_lora_state_dict(Path(lora_path))
+            pipe.load_lora_weights(lora_sd)
+        except FileNotFoundError:
+            pipe.load_lora_weights(str(lora_path))
 
     return pipe
 

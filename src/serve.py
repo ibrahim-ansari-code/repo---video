@@ -31,6 +31,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from src.anecdote.lora_inference_utils import load_wan_peft_lora_state_dict
 from src.anecdote.video_gen import WAN_I2V_NEGATIVE_PROMPT
 
 # FastAPI is imported lazily at startup but we want the module to be importable
@@ -93,7 +94,11 @@ def _load_i2v_pipeline():
     lora_loaded = None
     if LORA_PATH and Path(LORA_PATH).exists():
         print(f"[serve] Loading LoRA from {LORA_PATH}")
-        pipe.load_lora_weights(LORA_PATH)
+        try:
+            lora_sd = load_wan_peft_lora_state_dict(Path(LORA_PATH))
+            pipe.load_lora_weights(lora_sd)
+        except FileNotFoundError:
+            pipe.load_lora_weights(LORA_PATH)
         lora_loaded = LORA_PATH
 
     _pipeline = pipe
