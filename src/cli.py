@@ -48,6 +48,12 @@ def main(ctx):
 @click.option("--dataset-max-samples", type=int, default=None,
               help="Max samples to download from built-in dataset (e.g. 8 for a quick test)")
 @click.option("--remote", default=None, help="URL of a remote GPU inference server (NodeOps, RunPod, etc.)")
+@click.option(
+    "--e2b-key",
+    default=None,
+    envvar="E2B_API_KEY",
+    help="E2B API key for cloud sandbox (Stage 3). Free tier: https://e2b.dev — or set E2B_API_KEY.",
+)
 def generate(
     repo_url: str,
     output: str,
@@ -64,6 +70,7 @@ def generate(
     dataset: str | None,
     dataset_max_samples: int | None,
     remote: str | None,
+    e2b_key: str | None,
 ):
     """Generate a demo video from a GitHub repo URL."""
     ensure_dirs()
@@ -84,6 +91,7 @@ def generate(
         dataset_name=dataset,
         dataset_max_samples=dataset_max_samples,
         remote_url=remote,
+        e2b_api_key=e2b_key,
     )
 
     console.print(Panel(
@@ -177,7 +185,7 @@ def _run_pipeline(config: PipelineConfig) -> None:
 
     # --- Stage 3: Sandbox (E2B cloud) ---
     console.rule("[bold]Stage 3: Running in E2B Sandbox")
-    sandbox = Sandbox(manifest)
+    sandbox = Sandbox(manifest, api_key=config.e2b_api_key)
     try:
         sandbox_result = sandbox.start()
 
@@ -197,13 +205,13 @@ def _run_pipeline(config: PipelineConfig) -> None:
 
     # --- Stage 5: Composite ---
     console.rule("[bold]Stage 5: Compositing Final Video")
-    from src.compositor import composite_video
+    from src.compositor import composite_video, subtitle_for_title_card
 
     composite_video(
         demo_path=demo_path,
         output_path=config.output_path,
         project_name=manifest.name,
-        project_description=manifest.description,
+        project_description=subtitle_for_title_card(manifest.package_description),
         repo_url=config.repo_url,
         anecdote_path=anecdote_path,
         overlay_text=overlay_text,

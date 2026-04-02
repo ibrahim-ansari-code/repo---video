@@ -60,10 +60,12 @@ class TestWebDemoScript:
         action_types = [a.action for a in script.actions]
         assert "navigate" in action_types
 
-    def test_includes_routes_from_readme(self, web_manifest):
+    def test_includes_ui_exploration_not_readme_routes(self, web_manifest):
         script = generate_web_demo_script(web_manifest, app_url="http://localhost:3000")
-        nav_values = [a.value for a in script.actions if a.action == "navigate"]
-        assert any("dashboard" in v for v in nav_values)
+        types = [a.action for a in script.actions]
+        assert "explore_ui" in types
+        nav = [a.value for a in script.actions if a.action == "navigate"]
+        assert nav == ["http://localhost:3000"]
 
 
 class TestCliDemoScript:

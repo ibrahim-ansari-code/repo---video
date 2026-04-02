@@ -55,6 +55,8 @@ class RepoManifest:
     readme_content: str = ""
     usage_examples: list[str] = field(default_factory=list)
     demo_hints: list[str] = field(default_factory=list)
+    # package.json "description" — safe for title cards; avoids README install steps.
+    package_description: str = ""
 
 
 def clone_repo(repo_url: str, target_dir: Path | None = None) -> Path:
@@ -127,6 +129,33 @@ def _scan_python_imports(repo_dir: Path) -> set[str]:
     return imports
 
 
+def _readme_line_poor_description(line: str) -> bool:
+    """Skip setup / install lines when picking a README summary for the manifest."""
+    s = line.strip()
+    if len(s) < 12:
+        return True
+    low = s.lower()
+    if re.match(r"^\d+\.\s", s):
+        return True
+    if any(
+        p in low
+        for p in (
+            "install depend",
+            "npm install",
+            "yarn install",
+            "pnpm install",
+            "clone the",
+            "git clone",
+            "getting started",
+            "```",
+            "development server",
+            "build the",
+        )
+    ):
+        return True
+    return False
+
+
 def parse_readme(repo_dir: Path) -> tuple[str, list[str], list[str]]:
     """Extract description, usage examples, and demo hints from README."""
     readme_path = None
@@ -152,6 +181,8 @@ def parse_readme(repo_dir: Path) -> tuple[str, list[str], list[str]]:
             continue
         if is_heading and not found_title:
             found_title = True
+            continue
+        if _readme_line_poor_description(stripped):
             continue
         description = stripped
         break
@@ -233,8 +264,16 @@ def analyze_repo(repo_url: str, clone_dir: Path | None = None) -> RepoManifest:
     """Full analysis pipeline: clone → detect → parse → build manifest."""
     repo_dir = clone_repo(repo_url, clone_dir)
     project_type, meta = detect_project_type(repo_dir)
-    description, usage_examples, demo_hints = parse_readme(repo_dir)
+    readme_desc, usage_examples, demo_hints = parse_readme(repo_dir)
     name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+
+    pkg = meta.get("pkg") or {}
+    pd = pkg.get("description")
+    package_description = pd.strip() if isinstance(pd, str) else ""
+    if len(package_description) > 8:
+        description = package_description
+    else:
+        description = readme_desc
 
     console.print(f"[bold green]Detected[/] {project_type.value} project: [bold]{name}[/]")
 
@@ -244,6 +283,7 @@ def analyze_repo(repo_url: str, clone_dir: Path | None = None) -> RepoManifest:
         project_type=project_type,
         name=name,
         description=description,
+        package_description=package_description,
         setup_commands=_build_setup_commands(project_type, meta),
         run_command=_build_run_command(project_type, meta),
         port=_get_port(project_type, meta),

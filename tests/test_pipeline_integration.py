@@ -125,8 +125,9 @@ class TestScriptGeneratorIntegration:
         )
         script = generate_web_demo_script(manifest, app_url="http://localhost:3000")
         assert len(script.actions) > 0
+        assert any(a.action == "explore_ui" for a in script.actions)
         nav_values = [a.value for a in script.actions if a.action == "navigate"]
-        assert any("dashboard" in v for v in nav_values)
+        assert "http://localhost:3000" in nav_values
 
     def test_cli_script_from_manifest(self, fake_cli_repo):
         from src.recorder.script_generator import generate_cli_demo_script

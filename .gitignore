@@ -11,3 +11,4 @@ build/
 *.cast
 .ruff_cache/
 .pytest_cache/
+.env

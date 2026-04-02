@@ -1,4 +1,4 @@
-"""Auto-generate demo scripts from README content and project type."""
+"""Auto-generate demo scripts — in-browser exploration, not README replay."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from src.analyzer import ProjectType, RepoManifest
 
 @dataclass
 class DemoAction:
-    action: str  # "navigate", "click", "type", "scroll", "wait", "screenshot"
+    action: str  # navigate, click, type, scroll, wait, screenshot, explore_ui
     selector: str = ""
     value: str = ""
     wait_ms: int = 1000
@@ -23,58 +23,54 @@ class DemoScript:
     url: str = ""
 
 
-def generate_web_demo_script(manifest: RepoManifest, app_url: str | None = None, host_port: int | None = None) -> DemoScript:
-    """Build a sequence of browser actions to demo a web app."""
+def generate_web_demo_script(
+    manifest: RepoManifest,
+    app_url: str | None = None,
+    host_port: int | None = None,
+) -> DemoScript:
+    """Drive the live app: load, wait for UI, click buttons/links, use inputs, scroll.
+
+    Does not navigate to paths guessed from the README — that often 404s or shows
+    the wrong screen for SPAs. Exploration uses real DOM controls on the current page.
+    """
     base_url = app_url or f"http://localhost:{host_port}"
     script = DemoScript(url=base_url)
 
-    script.actions.append(DemoAction(
-        action="navigate",
-        value=base_url,
-        wait_ms=3000,
-        description="Load the homepage",
-    ))
-
-    script.actions.append(DemoAction(
-        action="wait",
-        wait_ms=2000,
-        description="Let the page fully render",
-    ))
-
-    script.actions.append(DemoAction(
-        action="screenshot",
-        description="Capture the initial state",
-    ))
-
-    routes = _extract_routes_from_readme(manifest.readme_content)
-    for route in routes[:5]:
-        url = f"{base_url}{route}" if route.startswith("/") else f"{base_url}/{route}"
-        script.actions.append(DemoAction(
+    script.actions.append(
+        DemoAction(
             action="navigate",
-            value=url,
-            wait_ms=2000,
-            description=f"Navigate to {route}",
-        ))
-        script.actions.append(DemoAction(
-            action="screenshot",
-            description=f"Capture {route}",
-        ))
+            value=base_url,
+            wait_ms=800,
+            description="Open the running app",
+        )
+    )
 
-    script.actions += _generate_interaction_actions(manifest)
+    max_explore = "10"
+    script.actions.append(
+        DemoAction(
+            action="explore_ui",
+            value=max_explore,
+            wait_ms=0,
+            description="Click through buttons, links, and inputs on the page",
+        )
+    )
 
-    script.actions.append(DemoAction(
-        action="scroll",
-        value="bottom",
-        wait_ms=1500,
-        description="Scroll to the bottom of the page",
-    ))
-
-    script.actions.append(DemoAction(
-        action="scroll",
-        value="top",
-        wait_ms=1500,
-        description="Scroll back to top",
-    ))
+    script.actions.append(
+        DemoAction(
+            action="scroll",
+            value="bottom",
+            wait_ms=1800,
+            description="Scroll down to show more content",
+        )
+    )
+    script.actions.append(
+        DemoAction(
+            action="scroll",
+            value="top",
+            wait_ms=1200,
+            description="Scroll back to top",
+        )
+    )
 
     return script
 
@@ -100,7 +96,7 @@ def generate_cli_demo_script(manifest: RepoManifest) -> list[str]:
 
 
 def _extract_routes_from_readme(content: str) -> list[str]:
-    """Find URL paths mentioned in README."""
+    """Find URL paths mentioned in README (used by tests / optional tooling)."""
     routes: list[str] = []
     pattern = re.compile(r"(?:localhost[:\d]*|127\.0\.0\.1[:\d]*)(\/[a-zA-Z0-9/_-]+)")
     for match in pattern.finditer(content):
@@ -115,44 +111,6 @@ def _extract_routes_from_readme(content: str) -> list[str]:
             routes.append(route)
 
     return routes
-
-
-def _generate_interaction_actions(manifest: RepoManifest) -> list[DemoAction]:
-    """Generate generic interaction actions based on project type."""
-    actions: list[DemoAction] = []
-
-    actions.append(DemoAction(
-        action="click",
-        selector="a[href]:not([href^='http']):not([href^='#'])",
-        wait_ms=2000,
-        description="Click the first internal navigation link",
-    ))
-
-    actions.append(DemoAction(
-        action="click",
-        selector="button:visible:first-of-type",
-        wait_ms=1500,
-        description="Click the first visible button",
-    ))
-
-    form_actions = [
-        DemoAction(
-            action="type",
-            selector="input[type='text']:first-of-type, input[type='email']:first-of-type",
-            value="demo@example.com",
-            wait_ms=500,
-            description="Type into the first text input",
-        ),
-        DemoAction(
-            action="click",
-            selector="button[type='submit'], input[type='submit']",
-            wait_ms=2000,
-            description="Submit the form",
-        ),
-    ]
-    actions.extend(form_actions)
-
-    return actions
 
 
 def _is_safe_command(cmd: str) -> bool:

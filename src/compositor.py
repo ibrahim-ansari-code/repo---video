@@ -4,17 +4,264 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import textwrap
 from pathlib import Path
 
+from PIL import Image, ImageDraw, ImageFont
 from rich.console import Console
 
 from src.config import DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT, DEFAULT_FPS, ASSETS_DIR
 
 console = Console()
 
+_FFMPEG_DRAWTEXT: bool | None = None
+
+
+def _ffmpeg_has_drawtext() -> bool:
+    """Homebrew ffmpeg often ships without libfreetype, so drawtext is missing."""
+    global _FFMPEG_DRAWTEXT
+    if _FFMPEG_DRAWTEXT is not None:
+        return _FFMPEG_DRAWTEXT
+    r = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=0.1",
+            "-vf",
+            "drawtext=text='x':fontsize=12:fontcolor=white:x=1:y=1",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    err = (r.stderr or "") + (r.stdout or "")
+    _FFMPEG_DRAWTEXT = r.returncode == 0 and "No such filter" not in err
+    return _FFMPEG_DRAWTEXT
+
+
+def _load_truetype_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in (
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        if Path(path).is_file():
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _multiline_text_size(font: ImageFont.ImageFont, text: str, spacing: int = 4) -> tuple[int, int]:
+    lines = text.split("\n")
+    max_w = 0
+    total_h = 0
+    for line in lines:
+        if not line:
+            total_h += spacing
+            continue
+        l, t, r, b = font.getbbox(line)
+        max_w = max(max_w, r - l)
+        total_h += b - t + spacing
+    return max_w, max(0, total_h - spacing)
+
+
+def _video_stream_dimensions(path: Path) -> tuple[int, int]:
+    r = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    w, h = r.stdout.strip().split("x")
+    return int(w), int(h)
+
+
+def _png_to_video_segment(png_path: Path, out_mp4: Path, duration: float, fps: int, desc: str) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        str(png_path),
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t",
+        str(duration),
+        "-vf",
+        f"fps={fps}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-shortest",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_mp4),
+    ]
+    _run_ffmpeg(cmd, desc)
+
+
+def _generate_title_card_pillow(
+    output_path: Path,
+    name: str,
+    description: str,
+    width: int,
+    height: int,
+    fps: int,
+) -> None:
+    img = Image.new("RGB", (width, height), (17, 24, 39))
+    draw = ImageDraw.Draw(img)
+    desc = (description or "").strip()
+    name_size = min(72, max(28, width // max(len(name), 8)))
+    font_name = _load_truetype_font(name_size)
+
+    if not desc:
+        draw.text((width // 2, height // 2), name, font=font_name, fill=(255, 255, 255), anchor="mm")
+    else:
+        desc_size = min(36, max(18, width // 48))
+        font_desc = _load_truetype_font(desc_size)
+        draw.text((width // 2, height // 2 - 55), name, font=font_name, fill=(255, 255, 255), anchor="mm")
+        lines = textwrap.wrap(desc[:400], width=max(24, width // 28))[:5]
+        line_gap = font_desc.getbbox("Ay")[3] - font_desc.getbbox("Ay")[1] + 10
+        y = height // 2 + 25
+        for line in lines:
+            draw.text((width // 2, y), line, font=font_desc, fill=(204, 204, 204), anchor="mm")
+            y += line_gap
+
+    png_path = output_path.with_suffix(".title.png")
+    img.save(png_path)
+    try:
+        _png_to_video_segment(png_path, output_path, TITLE_DURATION, fps, "title card (pillow)")
+    finally:
+        png_path.unlink(missing_ok=True)
+
+
+def _generate_outro_card_pillow(
+    output_path: Path,
+    name: str,
+    repo_url: str,
+    width: int,
+    height: int,
+    fps: int,
+) -> None:
+    img = Image.new("RGB", (width, height), (17, 24, 39))
+    draw = ImageDraw.Draw(img)
+    font_lg = _load_truetype_font(min(48, width // 28))
+    font_sm = _load_truetype_font(min(28, width // 42))
+    line1 = f"Star {name} on GitHub"
+    draw.text((width // 2, height // 2 - 45), line1, font=font_lg, fill=(255, 255, 255), anchor="mm")
+    draw.text((width // 2, height // 2 + 35), repo_url, font=font_sm, fill=(96, 165, 250), anchor="mm")
+
+    png_path = output_path.with_suffix(".outro.png")
+    img.save(png_path)
+    try:
+        _png_to_video_segment(png_path, output_path, OUTRO_DURATION, fps, "outro card (pillow)")
+    finally:
+        png_path.unlink(missing_ok=True)
+
+
+def _add_text_overlay_pillow(
+    input_path: Path,
+    output_path: Path,
+    text: str,
+    position: str = "bottom",
+) -> None:
+    w, h = _video_stream_dimensions(input_path)
+    bar_h = max(90, min(200, h // 5))
+    bar = Image.new("RGBA", (w, bar_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(bar)
+    d.rounded_rectangle((0, 0, w, bar_h), radius=14, fill=(0, 0, 0, 200))
+    font = _load_truetype_font(min(36, max(20, w // 36)))
+    wrapped = textwrap.fill(text, width=max(16, w // 22))
+    tw, th = _multiline_text_size(font, wrapped)
+    tx = max(16, (w - tw) // 2)
+    ty = (bar_h - th) // 2 if position == "bottom" else max(8, (bar_h - th) // 2)
+    d.multiline_text((tx, ty), wrapped, font=font, fill=(255, 255, 255), spacing=6)
+
+    overlay_png = Path(tempfile.mktemp(suffix=".overlay.png"))
+    try:
+        bar.save(overlay_png)
+        y_expr = "main_h-overlay_h" if position == "bottom" else "(main_h-overlay_h)/2"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-i",
+            str(overlay_png),
+            "-filter_complex",
+            f"[0:v][1:v]overlay=0:{y_expr}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "copy",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        _run_ffmpeg(cmd, "text overlay (pillow)")
+    finally:
+        overlay_png.unlink(missing_ok=True)
+
 TITLE_DURATION = 3.0
 OUTRO_DURATION = 3.0
 CROSSFADE_DURATION = 1.0
+
+
+def subtitle_for_title_card(package_description: str) -> str:
+    """One-line title subtitle from package.json only — never README install steps."""
+    s = (package_description or "").strip()
+    if len(s) < 12 or len(s) > 140:
+        return ""
+    low = s.lower()
+    for bad in (
+        "install depend",
+        "npm install",
+        "yarn ",
+        "pnpm ",
+        "git clone",
+        "build ",
+        "compile",
+        "```",
+    ):
+        if bad in low:
+            return ""
+    return s
 
 
 def composite_video(
@@ -85,16 +332,21 @@ def _generate_title_card(
     fps: int,
 ) -> None:
     """Generate a title card video with the project name and description."""
+    if not _ffmpeg_has_drawtext():
+        _generate_title_card_pillow(output_path, name, description, width, height, fps)
+        return
+
     safe_name = _escape_ffmpeg_text(name)
     safe_desc = _escape_ffmpeg_text(description[:80] if description else "")
 
     font_size_name = min(72, width // (len(name) + 1))
     font_size_desc = min(36, width // max(len(safe_desc), 1))
 
+    name_y = "(h-text_h)/2" if not safe_desc else "(h-text_h)/2-40"
     drawtext_name = (
         f"drawtext=text='{safe_name}'"
         f":fontsize={font_size_name}:fontcolor=white"
-        f":x=(w-text_w)/2:y=(h-text_h)/2-40"
+        f":x=(w-text_w)/2:y={name_y}"
         f":alpha='if(lt(t,0.5),t/0.5,if(gt(t,{TITLE_DURATION - 0.5}),(({TITLE_DURATION}-t)/0.5),1))'"
     )
 
@@ -105,6 +357,8 @@ def _generate_title_card(
         f":alpha='if(lt(t,0.8),t/0.8,if(gt(t,{TITLE_DURATION - 0.5}),(({TITLE_DURATION}-t)/0.5),1))'"
     )
 
+    vf = drawtext_name if not safe_desc else f"{drawtext_name},{drawtext_desc}"
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi",
@@ -112,7 +366,7 @@ def _generate_title_card(
         "-f", "lavfi",
         "-i", f"anullsrc=channel_layout=stereo:sample_rate=44100",
         "-t", str(TITLE_DURATION),
-        "-vf", f"{drawtext_name},{drawtext_desc}",
+        "-vf", vf,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-shortest",
         "-pix_fmt", "yuv420p",
@@ -130,6 +384,10 @@ def _generate_outro_card(
     fps: int,
 ) -> None:
     """Generate an outro card with the repo URL."""
+    if not _ffmpeg_has_drawtext():
+        _generate_outro_card_pillow(output_path, name, repo_url, width, height, fps)
+        return
+
     safe_name = _escape_ffmpeg_text(name)
     safe_url = _escape_ffmpeg_text(repo_url)
 
@@ -188,6 +446,10 @@ def _add_text_overlay(
     position: str = "bottom",
 ) -> None:
     """Add a text overlay to an existing video."""
+    if not _ffmpeg_has_drawtext():
+        _add_text_overlay_pillow(input_path, output_path, text, position=position)
+        return
+
     safe_text = _escape_ffmpeg_text(text)
     y_expr = "h-th-60" if position == "bottom" else "(h-th)/2"
 

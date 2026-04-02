@@ -38,6 +38,7 @@ class PipelineConfig(BaseModel):
     dataset_name: str | None = None
     dataset_max_samples: int | None = None  # built-in dataset sample cap (smoke tests)
     remote_url: str | None = None  # URL of hosted inference server (NodeOps, etc.)
+    e2b_api_key: str | None = None  # E2B cloud sandbox (Stage 3); else env E2B_API_KEY
 
 
 def ensure_dirs() -> None:

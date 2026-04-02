@@ -130,15 +130,25 @@ class Sandbox:
     def _start_server(self, port: int) -> None:
         """Start the web server as a background process."""
         pt = self.manifest.project_type
-        start_cmd = START_COMMANDS.get(pt)
+        # Use manifest port for health checks / public URL; commands must listen on the same port.
+        if pt == ProjectType.REACT_VITE:
+            start_cmd = f"npx vite --host 0.0.0.0 --port {port}"
+        elif pt == ProjectType.NEXTJS:
+            start_cmd = f"npx next dev -p {port}"
+        elif pt == ProjectType.VUE:
+            start_cmd = f"npx vue-cli-service serve --port {port}"
+        else:
+            start_cmd = START_COMMANDS.get(pt)
 
         if start_cmd is None:
             start_cmd = self.manifest.run_command or "npm start"
 
         console.print(f"  [dim]Starting server: {start_cmd}[/]")
+        # Long-lived dev servers must run in the background; a foreground run hits E2B cmd timeout.
         self._sandbox.commands.run(
-            f"cd /home/user/project && {start_cmd} &",
-            timeout=5,
+            f"cd /home/user/project && {start_cmd}",
+            background=True,
+            timeout=60,
         )
 
         self._wait_for_server(port)
@@ -149,11 +159,12 @@ class Sandbox:
         deadline = time.time() + BOOT_WAIT_TIMEOUT
 
         while time.time() < deadline:
+            # E2B raises on non-zero exit; curl fails until the server is up — probe must exit 0.
             result = self._sandbox.commands.run(
-                f"curl -sf http://localhost:{port}/ -o /dev/null -w '%{{http_code}}'",
-                timeout=5,
+                f"bash -c 'curl -sf --connect-timeout 2 http://127.0.0.1:{port}/ -o /dev/null && echo OK || true'",
+                timeout=15,
             )
-            if result.exit_code == 0:
+            if (result.stdout or "").strip() == "OK":
                 return
             time.sleep(2)
 

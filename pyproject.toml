@@ -43,6 +43,7 @@ serve = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "python-dotenv>=1.0",
     "ruff>=0.4",
     "torchvision>=0.17",
 ]
@@ -52,6 +53,13 @@ repovideo = "src.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: uses network (e.g. git clone)",
+    "e2b: requires E2B_API_KEY; may create a cloud sandbox",
+    "slow: long-running (e.g. full E2B install + dev server)",
+]
 
 [tool.ruff]
 target-version = "py311"
