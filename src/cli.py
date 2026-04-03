@@ -54,6 +54,13 @@ def main(ctx):
     envvar="E2B_API_KEY",
     help="E2B API key for cloud sandbox (Stage 3). Free tier: https://e2b.dev — or set E2B_API_KEY.",
 )
+@click.option("--no-title-card", is_flag=True, help="Skip the title card at the start of the video")
+@click.option("--no-outro-card", is_flag=True, help="Skip the 'Star on GitHub' outro card at the end")
+@click.option(
+    "--env", "sandbox_envs",
+    multiple=True,
+    help="Environment variable for the sandbox (e.g. --env SUPABASE_URL=https://... --env SUPABASE_KEY=xxx)",
+)
 def generate(
     repo_url: str,
     output: str,
@@ -71,9 +78,21 @@ def generate(
     dataset_max_samples: int | None,
     remote: str | None,
     e2b_key: str | None,
+    no_title_card: bool,
+    no_outro_card: bool,
+    sandbox_envs: tuple[str, ...],
 ):
     """Generate a demo video from a GitHub repo URL."""
     ensure_dirs()
+
+    # Parse --env KEY=VALUE pairs
+    env_dict: dict[str, str] = {}
+    for pair in sandbox_envs:
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            env_dict[k] = v
+        else:
+            console.print(f"[yellow]Warning:[/] Ignoring --env '{pair}' (expected KEY=VALUE)")
 
     config = PipelineConfig(
         repo_url=repo_url,
@@ -92,6 +111,9 @@ def generate(
         dataset_max_samples=dataset_max_samples,
         remote_url=remote,
         e2b_api_key=e2b_key,
+        no_title_card=no_title_card,
+        no_outro_card=no_outro_card,
+        sandbox_env=env_dict,
     )
 
     console.print(Panel(
@@ -185,7 +207,7 @@ def _run_pipeline(config: PipelineConfig) -> None:
 
     # --- Stage 3: Sandbox (E2B cloud) ---
     console.rule("[bold]Stage 3: Running in E2B Sandbox")
-    sandbox = Sandbox(manifest, api_key=config.e2b_api_key)
+    sandbox = Sandbox(manifest, api_key=config.e2b_api_key, env=config.sandbox_env)
     try:
         sandbox_result = sandbox.start()
 
@@ -218,6 +240,8 @@ def _run_pipeline(config: PipelineConfig) -> None:
         width=config.width,
         height=config.height,
         fps=config.fps,
+        no_title_card=config.no_title_card,
+        no_outro_card=config.no_outro_card,
     )
 
     console.print(Panel(

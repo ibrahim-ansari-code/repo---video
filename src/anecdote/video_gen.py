@@ -12,7 +12,7 @@ from PIL import Image
 from rich.console import Console
 
 from src.anecdote.lora_inference_utils import load_wan_peft_lora_state_dict
-from src.config import MODELS_DIR, LORA_DIR, DEFAULT_FPS
+from src.config import MODELS_DIR, LORA_DIR, DEFAULT_FPS, CACHE_DIR
 
 console = Console()
 
@@ -35,6 +35,33 @@ def _wan_inference_dtype(device: str) -> torch.dtype:
     if device in ("cuda", "mps"):
         return torch.float16
     return torch.float32
+
+
+def load_wan_i2v_pipeline(model_id: str, *, dtype: torch.dtype, cache_dir: str):
+    """Load Wan2.1 I2V pipeline with VAE and image encoder in float32.
+
+    The VAE and CLIP image encoder MUST stay in float32 to avoid noisy/corrupted
+    decoded frames. Only the transformer runs in the reduced dtype (bfloat16).
+
+    Shared by video_gen.py and serve.py to keep the dtype logic in one place.
+    """
+    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+    from transformers import CLIPVisionModel
+
+    image_encoder = CLIPVisionModel.from_pretrained(
+        model_id, subfolder="image_encoder",
+        torch_dtype=torch.float32, cache_dir=cache_dir,
+    )
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae",
+        torch_dtype=torch.float32, cache_dir=cache_dir,
+    )
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        model_id, vae=vae, image_encoder=image_encoder,
+        torch_dtype=dtype,
+        cache_dir=cache_dir,
+    )
+    return pipe
 
 
 def generate_video_from_images(
@@ -90,19 +117,13 @@ def _load_wan_pipeline(
     vae_pixel_height: int = 480,
 ):
     """Load the Wan2.1 I2V pipeline with optional LoRA weights."""
-    from diffusers import WanImageToVideoPipeline
-
     model_id = WAN_I2V_720P if model_size == "14B" else WAN_I2V_480P
     device = _get_device()
     dtype = _wan_inference_dtype(device)
 
     console.print(f"  [dim]Loading Wan2.1 {model_size} on {device} ({dtype})[/]")
 
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        cache_dir=str(MODELS_DIR),
-    )
+    pipe = load_wan_i2v_pipeline(model_id, dtype=dtype, cache_dir=str(MODELS_DIR))
 
     if device == "cuda":
         pipe.enable_model_cpu_offload()

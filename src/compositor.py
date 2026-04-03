@@ -275,6 +275,8 @@ def composite_video(
     width: int = DEFAULT_VIDEO_WIDTH,
     height: int = DEFAULT_VIDEO_HEIGHT,
     fps: int = DEFAULT_FPS,
+    no_title_card: bool = False,
+    no_outro_card: bool = False,
 ) -> Path:
     """Build the final video from all segments."""
     console.print("[bold blue]Compositing[/] final video")
@@ -282,9 +284,10 @@ def composite_video(
     work_dir = Path(tempfile.mkdtemp(prefix="repovideo_comp_"))
     segments: list[Path] = []
 
-    title_path = work_dir / "title.mp4"
-    _generate_title_card(title_path, project_name, project_description, width, height, fps)
-    segments.append(title_path)
+    if not no_title_card:
+        title_path = work_dir / "title.mp4"
+        _generate_title_card(title_path, project_name, project_description, width, height, fps)
+        segments.append(title_path)
 
     if anecdote_path and anecdote_path.exists():
         scaled_anecdote = work_dir / "anecdote_scaled.mp4"
@@ -301,9 +304,10 @@ def composite_video(
     _scale_video(demo_path, scaled_demo, width, height, fps)
     segments.append(scaled_demo)
 
-    outro_path = work_dir / "outro.mp4"
-    _generate_outro_card(outro_path, project_name, repo_url, width, height, fps)
-    segments.append(outro_path)
+    if not no_outro_card:
+        outro_path = work_dir / "outro.mp4"
+        _generate_outro_card(outro_path, project_name, repo_url, width, height, fps)
+        segments.append(outro_path)
 
     if len(segments) > 1:
         joined = work_dir / "joined.mp4"

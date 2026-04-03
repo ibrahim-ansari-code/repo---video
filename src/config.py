@@ -39,6 +39,9 @@ class PipelineConfig(BaseModel):
     dataset_max_samples: int | None = None  # built-in dataset sample cap (smoke tests)
     remote_url: str | None = None  # URL of hosted inference server (NodeOps, etc.)
     e2b_api_key: str | None = None  # E2B cloud sandbox (Stage 3); else env E2B_API_KEY
+    no_title_card: bool = False  # Skip the project name title card at the start
+    no_outro_card: bool = False  # Skip the "Star on GitHub" outro card at the end
+    sandbox_env: dict[str, str] = Field(default_factory=dict)  # Env vars injected into sandbox
 
 
 def ensure_dirs() -> None:

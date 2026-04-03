@@ -64,8 +64,10 @@ class TestWebDemoScript:
         script = generate_web_demo_script(web_manifest, app_url="http://localhost:3000")
         types = [a.action for a in script.actions]
         assert "explore_ui" in types
+        assert "dismiss_modals" in types
+        assert "tour_navbar_deep" in types
         nav = [a.value for a in script.actions if a.action == "navigate"]
-        assert nav == ["http://localhost:3000"]
+        assert "http://localhost:3000" in nav
 
 
 class TestCliDemoScript:

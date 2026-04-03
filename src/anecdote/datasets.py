@@ -55,7 +55,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "Each sample has an Image_Prompt (first frame) + Text_Prompt (caption). "
             "The gold standard for image-to-video LoRA training."
         ),
-        "num_samples": 200,
+        "num_samples": 10000,
         "max_samples": 10000,
         "download_fn": "_download_tip_i2v",
     },
@@ -66,7 +66,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "PusaV1 training set — 3,860 Wan-T2V generated video-caption pairs. "
             "Good for learning motion/style but text-to-video only (no image condition)."
         ),
-        "num_samples": 200,
+        "num_samples": 3860,
         "max_samples": 3860,
         "download_fn": "_download_pusa_videos",
     },
@@ -77,7 +77,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "Pexels stock footage — professional camera motion, smooth "
             "transitions, cinematic lighting. Downloads actual video URLs."
         ),
-        "num_samples": 100,
+        "num_samples": 5000,
         "max_samples": 5000,
         "filter_keywords": [
             "cinematic", "aerial", "slow motion", "timelapse", "landscape",
@@ -90,9 +90,9 @@ BUILTIN_DATASETS: dict[str, dict] = {
         "tier": "video",
         "description": (
             "CC-BY YouTube corpus (transcripts + video_link). Streams parquet shards, "
-            "downloads ~12s clips via yt-dlp. Use a small NUM_SAMPLES (8–32) first; many URLs fail or rate-limit."
+            "downloads ~12s clips via yt-dlp. Slow due to yt-dlp per clip."
         ),
-        "num_samples": 16,
+        "num_samples": 2000,
         "max_samples": 2000,
         "parquet_shards": 8,
         "download_fn": "_download_youtube_commons_videos",
@@ -104,7 +104,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "Cinematic film clips with detailed scene descriptions — camera work, "
             "lighting, composition. 3,490 video-caption pairs."
         ),
-        "num_samples": 100,
+        "num_samples": 3490,
         "max_samples": 3490,
         "download_fn": "_download_cinematic_videos",
     },
@@ -115,7 +115,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "Developer/tech scenes — screens, typing, offices, code. "
             "Image-only (still frames); best for style transfer, not motion."
         ),
-        "num_samples": 100,
+        "num_samples": 1000,
         "max_samples": 1000,
         "filter_keywords": [
             "computer", "laptop", "coding", "typing", "office", "desk",
@@ -131,7 +131,7 @@ BUILTIN_DATASETS: dict[str, dict] = {
             "High-contrast dramatic scenes — storms, silhouettes, moody lighting. "
             "Image-only; good for anecdote intro style."
         ),
-        "num_samples": 100,
+        "num_samples": 1000,
         "max_samples": 1000,
         "filter_keywords": [
             "dramatic", "dark", "moody", "storm", "rain", "night",

@@ -32,7 +32,7 @@ import torch
 from PIL import Image
 
 from src.anecdote.lora_inference_utils import load_wan_peft_lora_state_dict
-from src.anecdote.video_gen import WAN_I2V_NEGATIVE_PROMPT
+from src.anecdote.video_gen import WAN_I2V_NEGATIVE_PROMPT, load_wan_i2v_pipeline
 
 # FastAPI is imported lazily at startup but we want the module to be importable
 # even without it installed (for type checking, tests, etc.)
@@ -62,24 +62,10 @@ def _load_i2v_pipeline():
     """Load the Wan2.1 I2V pipeline once at startup."""
     global _pipeline, _model_info
 
-    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-    from transformers import CLIPVisionModel
-
     model_id = _get_model_id()
     print(f"[serve] Loading {model_id}...")
 
-    image_encoder = CLIPVisionModel.from_pretrained(
-        model_id, subfolder="image_encoder",
-        torch_dtype=torch.float32, cache_dir=CACHE_DIR,
-    )
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae",
-        torch_dtype=torch.float32, cache_dir=CACHE_DIR,
-    )
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        model_id, vae=vae, image_encoder=image_encoder,
-        torch_dtype=torch.bfloat16, cache_dir=CACHE_DIR,
-    )
+    pipe = load_wan_i2v_pipeline(model_id, dtype=torch.bfloat16, cache_dir=CACHE_DIR)
 
     if torch.cuda.is_available():
         pipe.enable_model_cpu_offload()

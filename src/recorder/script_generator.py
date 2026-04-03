@@ -10,7 +10,7 @@ from src.analyzer import ProjectType, RepoManifest
 
 @dataclass
 class DemoAction:
-    action: str  # navigate, click, type, scroll, wait, screenshot, explore_ui
+    action: str  # navigate, dismiss_modals, tour_navbar, explore_ui, ...
     selector: str = ""
     value: str = ""
     wait_ms: int = 1000
@@ -40,18 +40,57 @@ def generate_web_demo_script(
         DemoAction(
             action="navigate",
             value=base_url,
-            wait_ms=800,
+            wait_ms=600,
             description="Open the running app",
         )
     )
 
-    max_explore = "10"
+    # Full-screen modals (e.g. “START”, cookie banners) block nav — dismiss first.
+    script.actions.append(
+        DemoAction(
+            action="dismiss_modals",
+            wait_ms=1200,
+            description="Close welcome / overlay dialogs",
+        )
+    )
+
+    # React Router / SPA: walk real nav links so each route gets screen time.
+    # Tour each nav route. After each route, the recorder will auto-scroll
+    # and explore the page (see tour_navbar_deep action).
+    script.actions.append(
+        DemoAction(
+            action="tour_navbar_deep",
+            value="3000",
+            wait_ms=0,
+            description="Visit each route: scroll through page, click elements, then next",
+        )
+    )
+
+    # Final exploration pass on the landing page
+    script.actions.append(
+        DemoAction(
+            action="navigate",
+            value=base_url,
+            wait_ms=800,
+            description="Return to home for final exploration",
+        )
+    )
+
     script.actions.append(
         DemoAction(
             action="explore_ui",
-            value=max_explore,
+            value="10",
             wait_ms=0,
-            description="Click through buttons, links, and inputs on the page",
+            description="Click main-content controls (cards, buttons, inputs)",
+        )
+    )
+
+    script.actions.append(
+        DemoAction(
+            action="zoom_section",
+            value="main, #root > div > div, .container, [class*='content']",
+            wait_ms=2500,
+            description="Zoom in on main content area",
         )
     )
 
@@ -128,11 +167,12 @@ def _is_safe_command(cmd: str) -> bool:
 
 def _generate_default_cli_commands(manifest: RepoManifest) -> list[str]:
     """Fallback commands when README doesn't have usage examples."""
+    name = manifest.name or "app"
     pt = manifest.project_type
     if pt == ProjectType.RUST:
-        return ["./target/release/app --help", "./target/release/app"]
+        return [f"./target/release/{name} --help", f"./target/release/{name}"]
     if pt == ProjectType.GO:
-        return ["./app --help", "./app"]
+        return [f"./{name} --help", f"./{name}"]
     if pt == ProjectType.PYTHON_GENERIC:
-        return ["python -m app --help", "python -m app"]
+        return [f"python -m {name} --help", f"python -m {name}"]
     return ["echo 'Demo: running the project'"]
